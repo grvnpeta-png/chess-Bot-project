@@ -1,0 +1,283 @@
+import numpy as np
+import pandas as pd
+from typing import Tuple, List, Union, Dict, Any, Generator
+
+# =====================================================================
+# 📦 ZERO-ALLOCATION TRACKING COORDINATE VECTOR STRUCT
+# =====================================================================
+class Coord:
+    """
+    Represents a singular square on an 8x8 chessboard matrix.
+    Uses __slots__ to enforce absolute structural performance overhead limits.
+    """
+    __slots__ = ['file_index', 'rank_index']
+
+    def __init__(self, file_or_square: int, rank_index: int = None):
+        if rank_index is None:
+            self.file_index = file_or_square & 0b111
+            self.rank_index = file_or_square >> 3
+        else:
+            self.file_index = file_or_square
+            self.rank_index = rank_index
+
+    def is_valid_square(self) -> bool:
+        return 0 <= self.file_index < 8 and 0 <= self.rank_index < 8
+
+    @property
+    def square_index(self) -> int:
+        return (self.rank_index * 8) + self.file_index
+
+    def __add__(self, other: Union[Tuple[int, int], 'Coord']) -> 'Coord':
+        if isinstance(other, tuple):
+            return Coord(self.file_index + other[0], self.rank_index + other[1])
+        return Coord(self.file_index + other.file_index, self.rank_index + other.rank_index)
+
+    def __sub__(self, other: 'Coord') -> Tuple[int, int]:
+        return (self.file_index - other.file_index, self.rank_index - other.rank_index)
+
+    def __mul__(self, scalar: int) -> Tuple[int, int]:
+        return (self.file_index * scalar, self.rank_index * scalar)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Coord):
+            return False
+        return self.file_index == other.file_index and self.rank_index == other.rank_index
+
+    def __repr__(self) -> str:
+        return f"Coord(File={self.file_index}, Rank={self.rank_index}, Index={self.square_index})"
+
+
+# =====================================================================
+# 🗺️ ENGINE BOARD HELPER & ADVANCED PRECOMPUTATION INTERFACE
+# =====================================================================
+class BoardHelper:
+    """
+    Core caching engine logic layer. Contains complete distance tracking matrices,
+    ray tracing caches, tensor feature conversion models, and analytical summary exports.
+    """
+    file_names = "abcdefgh"
+    rank_names = "12345678"
+
+    # Strict flat linear bit indices
+    a1, b1, c1, d1, e1, f1, g1, h1 = range(8)
+    a2, b2, c2, d2, e2, f2, g2, h2 = range(8, 16)
+    a7, b7, c7, d7, e7, f7, g7, h7 = range(48, 56)
+    a8, b8, c8, d8, e8, f8, g8, h8 = range(56, 64)
+
+    # Direction Vectors
+    RookDirections = [(-1, 0), (1, 0), (0, 1), (0, -1)]
+    BishopDirections = [(-1, 1), (1, 1), (1, -1), (-1, -1)]
+    KingDirections = RookDirections + BishopDirections
+    KnightJumps = [(-2, -1), (-2, 1), (-1, 2), (1, 2), (2, 1), (2, -1), (1, -2), (-1, -2)]
+
+    # Dynamic Memory Global Caching Collections (LUT Arrays)
+    SquareToIndexLUT: Dict[str, int] = {}
+    IndexToSquareLUT: List[str] = [""] * 64
+    LightSquareLUT: List[bool] = [False] * 64
+    
+    # Num squares to the closest edge: [SquareIndex][DirectionIndex]
+    # Directions order for distance: North, South, West, East, NW, NE, SW, SE
+    NumSquaresToEdge: List[List[int]] = [[0] * 8 for _ in range(64)]
+    
+    # Precalculated ray bitmasks linking square to square
+    # RayBetweenSquares[StartSquare][EndSquare] -> Bitboard of path
+    RayBetweenSquares: List[List[int]] = [[0] * 64 for _ in range(64)]
+
+    @classmethod
+    def initialize_lookups(cls):
+        """Executes a massive programmatic look-ahead sequence mapping spatial geometries."""
+        # 1. Map Coordinates and Color Parity Matrices
+        for rank in range(8):
+            for file in range(8):
+                idx = (rank * 8) + file
+                name = f"{cls.file_names[file]}{cls.rank_names[rank]}"
+                cls.SquareToIndexLUT[name] = idx
+                cls.IndexToSquareLUT[idx] = name
+                cls.LightSquareLUT[idx] = (file + rank) % 2 != 0
+
+        # 2. Build Structural Distance-To-Edge Bounds Arrays
+        for rank in range(8):
+            for file in range(8):
+                idx = (rank * 8) + file
+                
+                num_north = 7 - rank
+                num_south = rank
+                num_west = file
+                num_east = 7 - file
+                
+                cls.NumSquaresToEdge[idx] = [
+                    num_north,
+                    num_south,
+                    num_west,
+                    num_east,
+                    min(num_north, num_west),
+                    min(num_north, num_east),
+                    min(num_south, num_west),
+                    min(num_south, num_east)
+                ]
+
+        # 3. Construct Positional Line Intersect Bitmasks (Ray-Casting Maps)
+        for start_sq in range(64):
+            for end_sq in range(64):
+                if start_sq == end_sq:
+                    continue
+                start_f, start_r = start_sq & 7, start_sq >> 3
+                end_f, end_r = end_sq & 7, end_sq >> 3
+                
+                df = end_f - start_f
+                dr = end_r - start_r
+                
+                gcd = np.gcd(abs(df), abs(dr))
+                if gcd > 0:
+                    step_f = df // gcd
+                    step_r = dr // gcd
+                    
+                    # Verify direction is a valid linear chess vector component
+                    if abs(step_f) <= 1 and abs(step_r) <= 1:
+                        ray_mask = 0
+                        curr_f = start_f + step_f
+                        curr_r = start_r + step_r
+                        
+                        while curr_f != end_f or curr_r != end_r:
+                            curr_idx = (curr_r * 8) + curr_f
+                            ray_mask |= (1 << curr_idx)
+                            curr_f += step_f
+                            curr_r += step_r
+                            
+                        cls.RayBetweenSquares[start_sq][end_sq] = ray_mask
+
+    @staticmethod
+    def rank_index(square_index: int) -> int:
+        return square_index >> 3
+
+    @staticmethod
+    def file_index(square_index: int) -> int:
+        return square_index & 0b111
+
+    @staticmethod
+    def index_from_coord_ints(file_index: int, rank_index: int) -> int:
+        return (rank_index * 8) + file_index
+
+    @staticmethod
+    def is_valid_coordinate(x: int, y: int) -> bool:
+        return 0 <= x < 8 and 0 <= y < 8
+
+    @staticmethod
+    def light_square(square_index: int) -> bool:
+        return BoardHelper.LightSquareLUT[square_index]
+
+    @staticmethod
+    def square_name_from_index(square_index: int) -> str:
+        return BoardHelper.IndexToSquareLUT[square_index]
+
+    @staticmethod
+    def square_index_from_name(name: str) -> int:
+        cleaned_name = name.strip().lower()
+        if cleaned_name in BoardHelper.SquareToIndexLUT:
+            return BoardHelper.SquareToIndexLUT[cleaned_name]
+        raise ValueError(f"Invalid algebraic coordinate reference formatting: '{name}'")
+
+    # =====================================================================
+    # 🧮 DEEP LEARNING AUGMENTATIONS & TENSOR MANIPULATION ARRAYS
+    # =====================================================================
+    @staticmethod
+    def mirror_horizontal_index(square_index: int) -> int:
+        """Inverts a flat square index horizontally (File reflection a <-> h)."""
+        file = square_index & 7
+        rank = square_index >> 3
+        return (rank * 8) + (7 - file)
+
+    @staticmethod
+    def mirror_vertical_index(square_index: int) -> int:
+        """Inverts a flat square index vertically (Rank reflection 1 <-> 8)."""
+        file = square_index & 7
+        rank = square_index >> 3
+        return ((7 - rank) * 8) + file
+
+    @staticmethod
+    def generate_bitboard_from_squares(squares: List[int]) -> int:
+        """Encodes an array list of indices into a unified 64-bit integer bitfield."""
+        bitboard = 0
+        for sq in squares:
+            bitboard |= (1 << sq)
+        return bitboard
+
+    @staticmethod
+    def extract_squares_from_bitboard(bitboard: int) -> Generator[int, None, None]:
+        """Iterates through and yields individual active index markers inside a bitboard."""
+        temp = bitboard & 0xFFFFFFFFFFFFFFFF
+        while temp:
+            lsb = temp & -temp
+            yield (lsb - 1).bit_count()
+            temp &= temp - 1
+
+    @staticmethod
+    def export_to_numpy_matrix(board) -> np.ndarray:
+        """Converts structural states into an 8x8 scalar matrix array."""
+        matrix = np.zeros((8, 8), dtype=np.int32)
+        for rank in range(8):
+            for file in range(8):
+                matrix[rank, file] = board.square[(rank * 8) + file]
+        return matrix
+
+    @staticmethod
+    def export_to_one_hot_tensor(board) -> np.ndarray:
+        """Constructs a categorical deep learning classification board image tensor [12, 8, 8]."""
+        tensor = np.zeros((12, 8, 8), dtype=np.float32)
+        piece_to_channel = {
+            1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5,       # White Pieces
+            9: 6, 10: 7, 11: 8, 12: 9, 13: 10, 14: 11 # Black Pieces
+        }
+        for square in range(64):
+            piece = board.square[square]
+            if piece in piece_to_channel:
+                tensor[piece_to_channel[piece], square >> 3, square & 7] = 1.0
+        return tensor
+
+    # =====================================================================
+    # 🖼️ PRODUCTION TERMINAL SCHEMATIC INTERFACE GENERATOR
+    # =====================================================================
+    @staticmethod
+    def create_diagram(board, black_at_top: bool = True, include_metadata: bool = True) -> str:
+        """Generates a detailed text grid showing piece layouts and engine signatures."""
+        diagram = []
+        last_move_target = board.all_game_moves[-1].target_square if len(board.all_game_moves) > 0 else -1
+
+        diagram.append("\n    === ♟️ GRAPHICAL BOARD COMPOSITOR DIAGRAM ===\n")
+        for y in range(8):
+            rank = (7 - y) if black_at_top else y
+            diagram.append("   +---+---+---+---+---+---+---+---+\n")
+            diagram.append(f" {rank + 1} ")
+
+            for x in range(8):
+                file = x if black_at_top else (7 - x)
+                sq = (rank * 8) + file
+                piece = board.square[sq]
+                
+                symbol = "." if piece == 0 else str(piece)
+                if hasattr(board, 'get_piece_symbol'):
+                    symbol = board.get_piece_symbol(piece)
+
+                if sq == last_move_target:
+                    diagram.append(f"|({symbol})")
+                else:
+                    diagram.append(f"| {symbol} ")
+
+            diagram.append("|\n")
+
+        diagram.append("   +---+---+---+---+---+---+---+---+\n")
+        diagram.append("     a   b   c   d   e   f   g   h\n" if black_at_top else "     h   g   f   e   d   c   b   a\n")
+
+        if include_metadata:
+            diagram.append("-" * 42 + "\n")
+            diagram.append(f"[Active Turn   ]: {'White' if board.is_white_to_move else 'Black'}\n")
+            diagram.append(f"[Fifty-Move Plies]: {getattr(board, 'fifty_move_counter', 0)}\n")
+            diagram.append(f"[Zobrist Signature]: {hex(getattr(board, 'zobrist_key', 0))}\n")
+            diagram.append("-" * 42 + "\n")
+
+        return "".join(diagram)
+
+
+# Initialize lookups immediately when the helper script compiles
+BoardHelper.initialize_lookups()
+
