@@ -1,0 +1,264 @@
+import numpy as np
+import random
+import json
+from typing import Dict, List, Tuple, Optional, Any, Union
+
+class BookMove:
+    __slots__ = ['move_string', 'num_times_played', 'flags', 'performance_rating', 'metadata_vector', 'weight_history']
+    def __init__(self, move_string: str, num_times_played: int, flags: int = 0, rating: float = 2400.0) -> None:
+        self.move_string: str = move_string
+        self.num_times_played: int = num_times_played
+        self.flags: int = flags
+        self.performance_rating: float = rating
+        self.metadata_vector = np.array([num_times_played, flags, rating], dtype=np.float64)
+        self.weight_history: List[float] = [float(num_times_played)]
+
+class OpeningBook:
+    def __init__(self, file_content: str) -> None:
+        self.moves_by_position: Dict[str, List[BookMove]] = {}
+        self.weight_matrix_cache: Dict[str, np.ndarray] = {}
+        self.rating_matrix_cache: Dict[str, np.ndarray] = {}
+        self.position_bit_masks: Dict[str, int] = {}
+        self._rng: random.Random = random.Random()
+        self.total_positions_loaded: int = 0
+        self.total_individual_moves_mapped: int = 0
+        self.parse_errors_encountered: int = 0
+        self.statistical_telemetry_history: List[Dict[str, Any]] = []
+        self.markov_transition_matrix: Optional[np.ndarray] = None
+        self.global_hyperparams: Dict[str, float] = {"dirichlet_alpha": 0.3, "temperature": 1.0, "min_z": -1.96}
+        self.serialization_buffer: bytearray = bytearray()
+        self._parse_book_file(file_content)
+
+    def _remove_move_counters_from_fen(self, fen: str) -> str:
+        parts = fen.strip().split(' ')
+        return " ".join(parts[:4]) if len(parts) >= 4 else fen
+
+    def _parse_book_file(self, file_content: str) -> None:
+        if not file_content: return
+        raw_entries: List[str] = file_content.strip(' \n').split('pos')
+        start_idx = 1 if file_content.strip().startswith('pos') else 0
+        
+        for idx, entry in enumerate(raw_entries[start_idx:]):
+            lines = [l.strip() for l in entry.strip('\n').split('\n') if l.strip()]
+            if not lines: continue
+            try:
+                pos_fen = self._remove_move_counters_from_fen(lines[0])
+                book_moves_list: List[BookMove] = []
+                for m_line in lines[1:]:
+                    m_parts = m_line.split(' ')
+                    if len(m_parts) >= 2:
+                        m_str = str(m_parts[0]).strip()
+                        p_count = int(m_parts[1])
+                        flg = int(m_parts[2]) if len(m_parts) > 2 else 0
+                        rat = float(m_parts[3]) if len(m_parts) > 3 else 2500.0
+                        book_moves_list.append(BookMove(m_str, p_count, flg, rat))
+                        self.total_individual_moves_mapped += 1
+                if book_moves_list:
+                    self.moves_by_position[pos_fen] = book_moves_list
+                    self.total_positions_loaded += 1
+                    self.position_bit_masks[pos_fen] = hash(pos_fen) & 0xFFFFFFFFFFFFFFFF
+            except Exception:
+                self.parse_errors_encountered += 1
+        self.optimize_structures()
+
+    def try_get_book_move(self, current_fen: str, weight_pow: float = 0.5) -> Tuple[bool, str]:
+        std_fen = self._remove_move_counters_from_fen(current_fen)
+        if std_fen not in self.moves_by_position: return False, "Null"
+        moves = self.moves_by_position[std_fen]
+        
+        raw_w = self.weight_matrix_cache.get(std_fen, np.array([m.num_times_played for m in moves], dtype=np.float64))
+        scaled_w = np.power(raw_w, max(0.0, min(1.0, weight_pow)))
+        t_sum = np.sum(scaled_w)
+        if t_sum == 0: return False, "Null"
+        
+        pmf = scaled_w / t_sum
+        cdf = np.cumsum(pmf)
+        idx = min(np.searchsorted(cdf, self._rng.random()), len(moves) - 1)
+        
+        self.statistical_telemetry_history.append({
+            "node_hash": self.position_bit_masks[std_fen],
+            "shannon_entropy": -np.sum(pmf * np.log2(pmf + 1e-9)),
+            "variance": np.var(pmf),
+            "selected_move": moves[idx].move_string
+        })
+        return True, moves[idx].move_string
+
+    def sample_via_gumbel_max(self, current_fen: str, temperature: float = 1.0) -> str:
+        std_fen = self._remove_move_counters_from_fen(current_fen)
+        if std_fen not in self.moves_by_position: return "Null"
+        moves = self.moves_by_position[std_fen]
+        w = self.weight_matrix_cache[std_fen]
+        
+        logits = np.log(w + 1e-9) / max(1e-4, temperature)
+        gumbel_noise = -np.log(-np.log(np.random.rand(len(w)) + 1e-9) + 1e-9)
+        idx = int(np.argmax(logits + gumbel_noise))
+        return moves[idx].move_string
+
+    def inject_dirichlet_exploration_noise(self, current_fen: str, epsilon: float = 0.25) -> np.ndarray:
+        std_fen = self._remove_move_counters_from_fen(current_fen)
+        if std_fen not in self.weight_matrix_cache: return np.array([], dtype=np.float64)
+        w = self.weight_matrix_cache[std_fen]
+        
+        base_pmf = w / np.sum(w)
+        alpha_vector = np.ones(len(w)) * self.global_hyperparams["dirichlet_alpha"]
+        noise = np.random.dirichlet(alpha_vector)
+        return (1.0 - epsilon) * base_pmf + epsilon * noise
+
+    def optimize_structures(self) -> None:
+        for fen, moves in self.moves_by_position.items():
+            self.weight_matrix_cache[fen] = np.array([m.num_times_played for m in moves], dtype=np.float64)
+            self.rating_matrix_cache[fen] = np.array([m.performance_rating for m in moves], dtype=np.float64)
+
+    def compute_distribution_descriptive_stats(self, fen: str) -> Dict[str, float]:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.weight_matrix_cache: return {"mean": 0.0, "std_dev": 0.0, "skewness": 0.0, "kurtosis": 0.0}
+        w = self.weight_matrix_cache[std]
+        if len(w) == 0: return {"mean": 0.0, "std_dev": 0.0, "skewness": 0.0, "kurtosis": 0.0}
+        
+        mean = np.mean(w)
+        std_dev = np.std(w) + 1e-9
+        skew = np.mean(((w - mean) / std_dev) ** 3) if len(w) > 2 else 0.0
+        kurt = np.mean(((w - mean) / std_dev) ** 4) if len(w) > 3 else 0.0
+        return {"mean": float(mean), "std_dev": float(std_dev), "skewness": float(skew), "kurtosis": float(kurt)}
+
+    def dynamic_z_score_pruning(self, threshold_z: float = -1.5) -> None:
+        keys_to_delete = []
+        for fen, moves in self.moves_by_position.items():
+            w = self.weight_matrix_cache.get(fen, np.array([m.num_times_played for m in moves], dtype=np.float64))
+            if len(w) <= 1: continue
+            mean, std = np.mean(w), np.std(w) + 1e-9
+            z_scores = (w - mean) / std
+            filtered_moves = [moves[i] for i, z in enumerate(z_scores) if z >= threshold_z]
+            if filtered_moves: self.moves_by_position[fen] = filtered_moves
+            else: keys_to_delete.append(fen)
+        for k in keys_to_delete:
+            del self.moves_by_position[k]
+            if k in self.weight_matrix_cache: del self.weight_matrix_cache[k]
+            if k in self.position_bit_masks: del self.position_bit_masks[k]
+        self.optimize_structures()
+
+    def generate_stochastic_sample_matrix(self) -> Tuple[np.ndarray, np.ndarray]:
+        keys = np.array(list(self.position_bit_masks.values()), dtype=np.uint64)
+        entropies = []
+        for fen in self.moves_by_position.keys():
+            w = self.weight_matrix_cache[fen]
+            pmf = w / (np.sum(w) + 1e-9)
+            entropies.append(-np.sum(pmf * np.log2(pmf + 1e-9)))
+        return keys, np.array(entropies, dtype=np.float64)
+
+    def reweight_via_bayesian_rating_prior(self, fen: str, prior_weight: float = 10.0, prior_rating: float = 2400.0) -> np.ndarray:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.moves_by_position: return np.array([], dtype=np.float64)
+        moves = self.moves_by_position[std]
+        w = self.weight_matrix_cache[std]
+        ratings = self.rating_matrix_cache[std]
+        posterior_scores = (w * ratings + prior_weight * prior_rating) / (w + prior_weight)
+        return posterior_scores / np.sum(posterior_scores)
+
+    def execute_chi_square_goodness_of_fit(self, fen: str, observed_counts: np.ndarray) -> Tuple[float, bool]:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.weight_matrix_cache: return 0.0, False
+        expected_counts = self.weight_matrix_cache[std]
+        if len(expected_counts) != len(observed_counts): return 0.0, False
+        
+        sum_exp, sum_obs = np.sum(expected_counts), np.sum(observed_counts)
+        if sum_exp == 0 or sum_obs == 0: return 0.0, False
+        
+        p_exp = expected_counts / sum_exp
+        scaled_expected = p_exp * sum_obs
+        chi_stat = np.sum(((observed_counts - scaled_expected) ** 2) / (scaled_expected + 1e-9))
+        return float(chi_stat), bool(chi_stat < 3.84)
+
+    def merge_distributions(self, target_book: 'OpeningBook') -> None:
+        for fen, moves in target_book.moves_by_position.items():
+            if fen in self.moves_by_position:
+                existing = {m.move_string for m in self.moves_by_position[fen]}
+                for ext_m in moves:
+                    if ext_m.move_string not in existing: self.moves_by_position[fen].append(ext_m)
+            else:
+                self.moves_by_position[fen] = moves
+                self.position_bit_masks[fen] = hash(fen) & 0xFFFFFFFFFFFFFFFF
+        self.optimize_structures()
+
+    def compile_markov_transition_graph(self, fen_sequence: List[str]) -> np.ndarray:
+        n_states = len(fen_sequence)
+        matrix = np.zeros((n_states, n_states), dtype=np.float64)
+        for i in range(n_states - 1):
+            f_curr, f_next = self._remove_move_counters_from_fen(fen_sequence[i]), self._remove_move_counters_from_fen(fen_sequence[i+1])
+            if f_curr in self.position_bit_masks and f_next in self.position_bit_masks:
+                idx_c = list(self.position_bit_masks.keys()).index(f_curr)
+                idx_n = list(self.position_bit_masks.keys()).index(f_next)
+                matrix[idx_c, idx_n] += 1.0
+        
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        self.markov_transition_matrix = np.divide(matrix, row_sums, out=np.zeros_like(matrix), where=row_sums!=0)
+        return self.markov_transition_matrix
+
+    def export_compressed_json_manifest(self) -> str:
+        manifest = {}
+        for fen, moves in self.moves_by_position.items():
+            manifest[fen] = [[m.move_string, int(m.num_times_played), int(m.flags), float(m.performance_rating)] for m in moves]
+        return json.dumps(manifest)
+
+    def import_compressed_json_manifest(self, json_str: str) -> None:
+        if not json_str: return
+        manifest = json.loads(json_str)
+        for fen, moves_data in manifest.items():
+            moves_list = []
+            for data in moves_data:
+                moves_list.append(BookMove(str(data[0]), int(data[1]), int(data[2]), float(data[3])))
+            self.moves_by_position[fen] = moves_list
+            self.position_bit_masks[fen] = hash(fen) & 0xFFFFFFFFFFFFFFFF
+        self.optimize_structures()
+
+    def update_weight_trajectory_vectors(self, fen: str, adjusted_weights: Dict[str, float]) -> None:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.moves_by_position: return
+        for m in self.moves_by_position[std]:
+            if m.move_string in adjusted_weights:
+                m.num_times_played = int(adjusted_weights[m.move_string])
+                m.weight_history.append(float(m.num_times_played))
+        self.optimize_structures()
+
+    def get_highest_rated_variance_nodes(self, top_n: int = 5) -> List[Tuple[str, float]]:
+        variances = []
+        for fen, ratings in self.rating_matrix_cache.items():
+            if len(ratings) > 1: variances.append((fen, float(np.var(ratings))))
+        variances.sort(key=lambda x: x[1], reverse=True)
+        return variances[:top_n]
+
+    def clear_all_cached_matrices(self) -> None:
+        self.weight_matrix_cache.clear()
+        self.rating_matrix_cache.clear()
+        self.markov_transition_matrix = None
+
+    def initialize_runtime_serialization_buffer(self, byte_allocation: int) -> None:
+        self.serialization_buffer = bytearray(byte_allocation)
+
+    def get_cumulative_book_mass(self) -> float:
+        total_mass = 0.0
+        for w in self.weight_matrix_cache.values(): total_mass += float(np.sum(w))
+        return total_mass
+
+    def get_shannon_wiener_index(self, fen: str) -> float:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.weight_matrix_cache: return 0.0
+        w = self.weight_matrix_cache[std]
+        if np.sum(w) == 0: return 0.0
+        p = w / np.sum(w)
+        return float(-np.sum(p * np.log(p + 1e-9)))
+
+    def evaluate_global_sparsity_ratio(self) -> float:
+        if not self.moves_by_position: return 1.0
+        total_slots = len(self.moves_by_position) * 20
+        return 1.0 - (self.total_individual_moves_mapped / float(total_slots))
+
+    def force_softmax_probability_distribution(self, fen: str) -> np.ndarray:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.rating_matrix_cache: return np.array([], dtype=np.float64)
+        r = self.rating_matrix_cache[std] / 100.0
+        e_r = np.exp(r - np.max(r))
+        return e_r / np.sum(e_r)
+
+    def run_principal_evaluation_sanity_check(self) -> bool:
+        return self.total_positions_loaded == len(self.moves_by_position)
