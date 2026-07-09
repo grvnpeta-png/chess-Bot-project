@@ -1,0 +1,567 @@
+import time
+
+# =====================================================================
+# 1. PIECE CLASS (Optimized with ML Weight Tuning Hooks)
+# =====================================================================
+class Piece:
+    """
+    Defines chess pieces using bitwise flags and masks.
+    """
+    None_Type = 0
+    Pawn = 1
+    Knight = 2
+    Bishop = 3
+    Rook = 4
+    Queen = 5
+    King = 6
+
+    White = 0
+    Black = 8
+
+    # Piece Bitmasks (Piece Type OR'ed with Color)
+    WhitePawn = Pawn | White
+    WhiteKnight = Knight | White
+    WhiteBishop = Bishop | White
+    WhiteRook = Rook | White
+    WhiteQueen = Queen | White
+    WhiteKing = King | White
+
+    BlackPawn = Pawn | Black
+    BlackKnight = Knight | Black
+    BlackBishop = Bishop | Black
+    BlackRook = Rook | Black
+    BlackQueen = Queen | Black
+    BlackKing = King | Black
+
+    MaxPieceIndex = BlackKing
+
+    typeMask = 0b0111
+    colourMask = 0b1000
+
+    @staticmethod
+    def make_piece(piece_type, piece_colour):
+        return piece_type | piece_colour
+
+    @staticmethod
+    def piece_type(piece):
+        return piece & Piece.typeMask
+
+    @staticmethod
+    def piece_colour(piece):
+        return piece & Piece.colourMask
+
+    @staticmethod
+    def is_white(piece):
+        return (piece & Piece.colourMask) == Piece.White and piece != 0
+
+    # =====================================================================
+    # 📊 MACHINE LEARNING PARAMETERS
+    # =====================================================================
+    # These values can be dynamically mutated by an external ML algorithm (like a tuner)
+    base_values = {
+        Pawn: 100, Knight: 300, Bishop: 300, Rook: 500, Queen: 900, King: 99999, None_Type: 0
+    }
+
+    @classmethod
+    def get_value(cls, piece):
+        """Returns the current ML-optimized material score for a piece."""
+        return cls.base_values.get(cls.piece_type(piece), 0)
+
+
+# =====================================================================
+# 2. COORDINATE STRUCTURE
+# =====================================================================
+class Coord:
+    """
+    Represents squares on the chess board as file/rank integer pairs.
+    """
+    def __init__(self, file_index, rank_index=None):
+        if rank_index is None:
+            self.file_index = file_index % 8  
+            self.rank_index = file_index // 8 
+        else:
+            self.file_index = file_index
+            self.rank_index = rank_index
+
+    def is_light_square(self):
+        return (self.file_index + self.rank_index) % 2 != 0
+
+    def is_valid_square(self):
+        return 0 <= self.file_index < 8 and 0 <= self.rank_index < 8
+
+    @property
+    def square_index(self):
+        return self.rank_index * 8 + self.file_index
+
+    def __add__(self, other):
+        return Coord(self.file_index + other.file_index, self.rank_index + other.rank_index)
+
+    def __sub__(self, other):
+        return Coord(self.file_index - other.file_index, self.rank_index - other.rank_index)
+
+    def __mul__(self, multiplier):
+        if isinstance(multiplier, int):
+            return Coord(self.file_index * multiplier, self.rank_index * multiplier)
+        return NotImplemented
+
+    def __rmul__(self, multiplier):
+        return self.__mul__(multiplier)
+
+    def __eq__(self, other):
+        if not isinstance(other, Coord):
+            return False
+        return self.file_index == other.file_index and self.rank_index == other.rank_index
+
+
+# =====================================================================
+# 3. GAME STATE HISTORICAL WRAPPER (With Feature Extraction Snapshots)
+# =====================================================================
+class GameState:
+    """
+    Immutable structure holding historical board state metrics.
+    """
+    ClearWhiteKingsideMask = 0b1110
+    ClearWhiteQueensideMask = 0b1101
+    ClearBlackKingsideMask = 0b1011
+    ClearBlackQueensideMask = 0b0111
+
+    def __init__(self, captured_piece_type, en_passant_file, castling_rights, fifty_move_counter, zobrist_key):
+        self.captured_piece_type = captured_piece_type
+        self.en_passant_file = en_passant_file
+        self.castling_rights = castling_rights
+        self.fifty_move_counter = fifty_move_counter
+        self.zobrist_key = zobrist_key
+        
+        # Snapshot metric features automatically evaluated for Data Science logs
+        self.metrics_snapshot = {
+            "fifty_move_val": fifty_move_counter,
+            "has_castle_rights": castling_rights > 0
+        }
+
+    def has_kingside_castle_right(self, white):
+        mask = 1 if white else 4
+        return (self.castling_rights & mask) != 0
+
+    def has_queenside_castle_right(self, white):
+        mask = 2 if white else 8
+        return (self.castling_rights & mask) != 0
+
+
+# =====================================================================
+# 4. MAIN BOARD STATE MANAGER
+# =====================================================================
+class Board:
+    WHITE_INDEX = 0
+    BLACK_INDEX = 1
+
+    def __init__(self):
+        self.square = [Piece.None_Type] * 64
+        self.king_square = [0, 0]
+        
+        # Bitboards handled as native arbitrary-precision Python ints for fast speed
+        self.piece_bitboards = [0] * (Piece.MaxPieceIndex + 1)
+        self.colour_bitboards = [0, 0]
+        self.all_pieces_bitboard = 0
+        
+        # Sliding ray targets
+        self.friendly_orthogonal_sliders = 0
+        self.friendly_diagonal_sliders = 0
+        self.enemy_orthogonal_sliders = 0
+        self.enemy_diagonal_sliders = 0
+        
+        self.total_piece_count_without_pawns_and_kings = 0
+        
+        self.is_white_to_move = True
+        self.repetition_position_history = []  
+        self.game_state_history = []           
+        self.all_game_moves = []               
+        self.ply_count = 0
+        
+        self.current_game_state = GameState(0, 0, 15, 0, 0)
+        self.start_position_info = None
+        self.cached_in_check_value = False
+        self.has_cached_in_check_value = False
+        
+        # Private arrays tracking piece list objects
+        self.all_piece_lists = [None] * (Piece.MaxPieceIndex + 1)
+        
+        # =====================================================================
+        # 📈 DATA SCIENCE MONITOR DATASET
+        # =====================================================================
+        self.analytics_log = {
+            "material_variance_history": [],
+            "complexity_over_time": []
+        }
+
+    # --- Properties ---
+    @property
+    def move_colour(self):
+        return Piece.White if self.is_white_to_move else Piece.Black
+
+    @property
+    def opponent_colour(self):
+        return Piece.Black if self.is_white_to_move else Piece.White
+
+    @property
+    def move_colour_index(self):
+        return Board.WHITE_INDEX if self.is_white_to_move else Board.BLACK_INDEX
+
+    @property
+    def opponent_colour_index(self):
+        return Board.BLACK_INDEX if self.is_white_to_move else Board.WHITE_INDEX
+
+    @property
+    def fifty_move_counter(self):
+        return self.current_game_state.fifty_move_counter
+
+    @property
+    def zobrist_key(self):
+        return self.current_game_state.zobrist_key
+
+    @property
+    def board_complexity_coefficient(self):
+        """Statistical metric calculating active piece complexity ratios."""
+        active_pieces = bin(self.all_pieces_bitboard).count("1")
+        return active_pieces / 32.0
+
+    # --- Utility Bit Manipulation Methods ---
+    def toggle_square(self, bitboard, square_index):
+        return bitboard ^ (1 << square_index)
+
+    def toggle_squares_helper(self, bitboard, sq_a, sq_b):
+        return bitboard ^ ((1 << sq_a) | (1 << sq_b))
+
+    def _move_piece_internal(self, piece, start_square, target_square):
+        self.piece_bitboards[piece] = self.toggle_squares_helper(self.piece_bitboards[piece], start_square, target_square)
+        self.colour_bitboards[self.move_colour_index] = self.toggle_squares_helper(self.colour_bitboards[self.move_colour_index], start_square, target_square)
+        
+        if self.all_piece_lists[piece]:
+            self.all_piece_lists[piece].move_piece(start_square, target_square)
+            
+        self.square[start_square] = Piece.None_Type
+        self.square[target_square] = piece
+
+    def _update_slider_bitboards_internal(self):
+        pass
+
+    # =====================================================================
+    # 5. THE MAKEMOVE EXECUTION PROTOCOL
+    # =====================================================================
+    def make_move(self, move, in_search=False):
+        start_square = move.start_square
+        target_square = move.target_square
+        move_flag = move.move_flag
+        is_promotion = move.is_promotion
+        is_en_passant = (move_flag == Move.EnPassantCaptureFlag)
+
+        moved_piece = self.square[start_square]
+        moved_piece_type = Piece.piece_type(moved_piece)
+        
+        if is_en_passant:
+            captured_piece = Piece.make_piece(Piece.Pawn, self.opponent_colour)
+        else:
+            captured_piece = self.square[target_square]
+            
+        captured_piece_type = Piece.piece_type(captured_piece)
+
+        prev_castle_state = self.current_game_state.castling_rights
+        prev_en_passant_file = self.current_game_state.en_passant_file
+        
+        new_zobrist_key = self.current_game_state.zobrist_key
+        new_castling_rights = self.current_game_state.castling_rights
+        new_en_passant_file = 0
+
+        if not in_search:
+            self.analytics_log["material_variance_history"].append(self.total_piece_count_without_pawns_and_kings)
+            self.analytics_log["complexity_over_time"].append(self.board_complexity_coefficient)
+
+        self._move_piece_internal(moved_piece, start_square, target_square)
+
+        # Handle Captures
+        if captured_piece_type != Piece.None_Type:
+            capture_square = target_square
+
+            if is_en_passant:
+                capture_square = target_square + (-8 if self.is_white_to_move else 8)
+                self.square[capture_square] = Piece.None_Type
+            
+            if captured_piece_type != Piece.Pawn:
+                self.total_piece_count_without_pawns_and_kings -= 1
+
+            if self.all_piece_lists[captured_piece]:
+                self.all_piece_lists[captured_piece].remove_piece_at_square(capture_square)
+                
+            self.piece_bitboards[captured_piece] = self.toggle_square(self.piece_bitboards[captured_piece], capture_square)
+            self.colour_bitboards[self.opponent_colour_index] = self.toggle_square(self.colour_bitboards[self.opponent_colour_index], capture_square)
+            
+            new_zobrist_key ^= Zobrist.pieces_array[captured_piece][capture_square]
+
+        # Handle King & Castling
+        if moved_piece_type == Piece.King:
+            self.king_square[self.move_colour_index] = target_square
+            new_castling_rights &= 0b1100 if self.is_white_to_move else 0b0011
+
+            if move_flag == Move.CastleFlag:
+                rook_piece = Piece.make_piece(Piece.Rook, self.move_colour)
+                kingside = (target_square in (6, 62)) 
+                castling_rook_from_index = (target_square + 1) if kingside else (target_square - 2)
+                castling_rook_to_index = (target_square - 1) if kingside else (target_square + 1)
+
+                self.piece_bitboards[rook_piece] = self.toggle_squares_helper(self.piece_bitboards[rook_piece], castling_rook_from_index, castling_rook_to_index)
+                self.colour_bitboards[self.move_colour_index] = self.toggle_squares_helper(self.colour_bitboards[self.move_colour_index], castling_rook_from_index, castling_rook_to_index)
+                
+                if self.all_piece_lists[rook_piece]:
+                    self.all_piece_lists[rook_piece].move_piece(castling_rook_from_index, castling_rook_to_index)
+                
+                self.square[castling_rook_from_index] = Piece.None_Type
+                self.square[castling_rook_to_index] = Piece.Rook | self.move_colour
+
+                new_zobrist_key ^= Zobrist.pieces_array[rook_piece][castling_rook_from_index]
+                new_zobrist_key ^= Zobrist.pieces_array[rook_piece][castling_rook_to_index]
+
+        # Handle Promotions
+        if is_promotion:
+            self.total_piece_count_without_pawns_and_kings += 1
+            promotion_piece_type = move.promotion_piece_type
+            promotion_piece = Piece.make_piece(promotion_piece_type, self.move_colour)
+
+            self.piece_bitboards[moved_piece] = self.toggle_square(self.piece_bitboards[moved_piece], target_square)
+            self.piece_bitboards[promotion_piece] = self.toggle_square(self.piece_bitboards[promotion_piece], target_square)
+            
+            if self.all_piece_lists[moved_piece]:
+                self.all_piece_lists[moved_piece].remove_piece_at_square(target_square)
+            if self.all_piece_lists[promotion_piece]:
+                self.all_piece_lists[promotion_piece].add_piece_at_square(target_square)
+                
+            self.square[target_square] = promotion_piece
+
+        # Double Pawn Move
+        if move_flag == Move.PawnTwoUpFlag:
+            file = (start_square % 8) + 1
+            new_en_passant_file = file
+            new_zobrist_key ^= Zobrist.en_passant_file[file]
+
+        # Castling Rights Masks
+        if prev_castle_state != 0:
+            if target_square == 7 or start_square == 7:
+                new_castling_rights &= GameState.ClearWhiteKingsideMask
+            elif target_square == 0 or start_square == 0:
+                new_castling_rights &= GameState.ClearWhiteQueensideMask
+            elif target_square == 63 or start_square == 63:
+                new_castling_rights &= GameState.ClearBlackKingsideMask
+            elif target_square == 56 or start_square == 56:
+                new_castling_rights &= GameState.ClearBlackQueensideMask
+
+        # Zobrist Incremental Updates
+        new_zobrist_key ^= Zobrist.side_to_move
+        new_zobrist_key ^= Zobrist.pieces_array[moved_piece][start_square]
+        new_zobrist_key ^= Zobrist.pieces_array[self.square[target_square]][target_square]
+        new_zobrist_key ^= Zobrist.en_passant_file[prev_en_passant_file]
+
+        if new_castling_rights != prev_castle_state:
+            new_zobrist_key ^= Zobrist.castling_rights[prev_castle_state]
+            new_zobrist_key ^= Zobrist.castling_rights[new_castling_rights]
+
+        # Finalizing Move Ply
+        self.is_white_to_move = not self.is_white_to_move
+        self.ply_count += 1
+        new_fifty_move_counter = self.current_game_state.fifty_move_counter + 1
+
+        self.all_pieces_bitboard = self.colour_bitboards[Board.WHITE_INDEX] | self.colour_bitboards[Board.BLACK_INDEX]
+        self._update_slider_bitboards_internal()
+
+        if moved_piece_type == Piece.Pawn or captured_piece_type != Piece.None_Type:
+            if not in_search:
+                self.repetition_position_history.clear()
+            new_fifty_move_counter = 0
+
+        new_state = GameState(captured_piece_type, new_en_passant_file, new_castling_rights, new_fifty_move_counter, new_zobrist_key)
+        self.game_state_history.append(new_state)
+        self.current_game_state = new_state
+        self.has_cached_in_check_value = False
+
+        if not in_search:
+            self.repetition_position_history.append(new_state.zobrist_key)
+            self.all_game_moves.append(move)
+
+    # =====================================================================
+    # 6. THE UNMAKEMOVE DECONSTRUCTION FUNCTION
+    # =====================================================================
+    def unmake_move(self, move, in_search=False):
+        """
+        Reverts the board state back by one full ply, popping the historical history stack.
+        """
+        self.is_white_to_move = not self.is_white_to_move
+        undoing_white_move = self.is_white_to_move
+
+        moved_from = move.start_square
+        moved_to = move.target_square
+        move_flag = move.move_flag
+
+        undoing_en_passant = (move_flag == Move.EnPassantCaptureFlag)
+        undoing_promotion = move.is_promotion
+        undoing_capture = (self.current_game_state.captured_piece_type != Piece.None_Type)
+
+        if undoing_promotion:
+            promoted_piece = self.square[moved_to]
+            pawn_piece = Piece.make_piece(Piece.Pawn, self.move_colour)
+            self.total_piece_count_without_pawns_and_kings -= 1
+
+            if self.all_piece_lists[promoted_piece]:
+                self.all_piece_lists[promoted_piece].remove_piece_at_square(moved_to)
+            if self.all_piece_lists[pawn_piece]:
+                self.all_piece_lists[pawn_piece].add_piece_at_square(moved_to)
+                
+            self.piece_bitboards[promoted_piece] = self.toggle_square(self.piece_bitboards[promoted_piece], moved_to)
+            self.piece_bitboards[pawn_piece] = self.toggle_square(self.piece_bitboards[pawn_piece], moved_to)
+            moved_piece = pawn_piece
+        else:
+            moved_piece = self.square[moved_to]
+
+        moved_piece_type = Piece.piece_type(moved_piece)
+        captured_piece_type = self.current_game_state.captured_piece_type
+
+        # Shift the piece backwards
+        self._move_piece_internal(moved_piece, moved_to, moved_from)
+
+        # Revert Captures
+        if undoing_capture:
+            capture_square = moved_to
+            captured_piece = Piece.make_piece(captured_piece_type, self.opponent_colour)
+
+            if undoing_en_passant:
+                capture_square = moved_to + (-8 if undoing_white_move else 8)
+                
+            if captured_piece_type != Piece.Pawn:
+                self.total_piece_count_without_pawns_and_kings += 1
+
+            self.piece_bitboards[captured_piece] = self.toggle_square(self.piece_bitboards[captured_piece], capture_square)
+            self.colour_bitboards[self.opponent_colour_index] = self.toggle_square(self.colour_bitboards[self.opponent_colour_index], capture_square)
+            
+            if self.all_piece_lists[captured_piece]:
+                self.all_piece_lists[captured_piece].add_piece_at_square(capture_square)
+            self.square[capture_square] = captured_piece
+
+        # Revert King position & Castling structures
+        if moved_piece_type == Piece.King:
+            self.king_square[self.move_colour_index] = moved_from
+
+            if move_flag == Move.CastleFlag:
+                rook_piece = Piece.make_piece(Piece.Rook, self.move_colour)
+                kingside = (moved_to in (6, 62))
+                rook_square_before_castling = (moved_to + 1) if kingside else (moved_to - 2)
+                rook_square_after_castling = (moved_to - 1) if kingside else (moved_to + 1)
+
+                self.piece_bitboards[rook_piece] = self.toggle_squares_helper(self.piece_bitboards[rook_piece], rook_square_after_castling, rook_square_before_castling)
+                self.colour_bitboards[self.move_colour_index] = self.toggle_squares_helper(self.colour_bitboards[self.move_colour_index], rook_square_after_castling, rook_square_before_castling)
+                
+                self.square[rook_square_after_castling] = Piece.None_Type
+                self.square[rook_square_before_castling] = rook_piece
+                if self.all_piece_lists[rook_piece]:
+                    self.all_piece_lists[rook_piece].move_piece(rook_square_after_castling, rook_square_before_castling)
+
+        # Re-sync unified occupancies
+        self.all_pieces_bitboard = self.colour_bitboards[Board.WHITE_INDEX] | self.colour_bitboards[Board.BLACK_INDEX]
+        self._update_slider_bitboards_internal()
+
+        if not in_search and len(self.repetition_position_history) > 0:
+            self.repetition_position_history.pop()
+        if not in_search and len(self.all_game_moves) > 0:
+            self.all_game_moves.pop()
+
+        self.game_state_history.pop()
+        self.current_game_state = self.game_state_history[-1]
+        self.ply_count -= 1
+        self.has_cached_in_check_value = False
+
+    # =====================================================================
+    # 7. NULL MOVE LOGIC
+    # =====================================================================
+    def make_null_move(self):
+        self.is_white_to_move = not self.is_white_to_move
+        self.ply_count += 1
+
+        new_zobrist_key = self.current_game_state.zobrist_key ^ Zobrist.side_to_move
+        new_zobrist_key ^= Zobrist.en_passant_file[self.current_game_state.en_passant_file]
+
+        new_state = GameState(Piece.None_Type, 0, self.current_game_state.castling_rights, self.current_game_state.fifty_move_counter + 1, new_zobrist_key)
+        self.current_game_state = new_state
+        self.game_state_history.append(new_state)
+        self._update_slider_bitboards_internal()
+        self.has_cached_in_check_value = True
+        self.cached_in_check_value = False
+
+    def unmake_null_move(self):
+        self.is_white_to_move = not self.is_white_to_move
+        self.ply_count -= 1
+        self.game_state_history.pop()
+        self.current_game_state = self.game_state_history[-1]
+        self._update_slider_bitboards_internal()
+        self.has_cached_in_check_value = True
+        self.cached_in_check_value = False
+
+    # =====================================================================
+    # 8. CHECK VERIFICATION VIA ATTACK MASK FILTERS
+    # =====================================================================
+    def is_in_check(self):
+        if self.has_cached_in_check_value:
+            return self.cached_in_check_value
+        self.cached_in_check_value = self.calculate_in_check_state()
+        self.has_cached_in_check_value = True
+        return self.cached_in_check_value
+
+    def calculate_in_check_state(self):
+        king_square = self.king_square[self.move_colour_index]
+        blockers = self.all_pieces_bitboard
+
+        if self.enemy_orthogonal_sliders != 0:
+            rook_attacks = Magic.get_rook_attacks(king_square, blockers)
+            if (rook_attacks & self.enemy_orthogonal_sliders) != 0:
+                return True
+
+        if self.enemy_diagonal_sliders != 0:
+            bishop_attacks = Magic.get_bishop_attacks(king_square, blockers)
+            if (bishop_attacks & self.enemy_diagonal_sliders) != 0:
+                return True
+
+        enemy_knights = self.piece_bitboards[Piece.make_piece(Piece.Knight, self.opponent_colour)]
+        if (BitBoardUtility.knight_attacks[king_square] & enemy_knights) != 0:
+            return True
+
+        enemy_pawns = self.piece_bitboards[Piece.make_piece(Piece.Pawn, self.opponent_colour)]
+        pawn_attack_mask = BitBoardUtility.white_pawn_attacks[king_square] if self.is_white_to_move else BitBoardUtility.black_pawn_attacks[king_square]
+        if (pawn_attack_mask & enemy_pawns) != 0:
+            return True
+
+        return False
+
+    # =====================================================================
+    # 9. POSITION LOAD INITIALIZERS
+    # =====================================================================
+    def load_start_position(self):
+        self.load_position(FenUtility.StartPositionFEN)
+
+    def load_position(self, fen):
+        if isinstance(fen, str):
+            pos_info = FenUtility.position_from_fen(fen)
+            self.load_position_from_info(pos_info)
+
+    def load_position_from_info(self, pos_info):
+        self.start_position_info = pos_info
+        self.square = [Piece.None_Type] * 64
+
+        for square_index in range(64):
+            piece = pos_info.squares[square_index]
+            piece_type = Piece.piece_type(piece)
+            colour_index = Board.WHITE_INDEX if Piece.is_white(piece) else Board.BLACK_INDEX
+            self.square[square_index] = piece
+
+            if piece != Piece.None_Type:
+                self.piece_bitboards[piece] = BitBoardUtility.set_square(self.piece_bitboards[piece], square_index)
+                self.colour_bitboards[colour_index] = BitBoardUtility.set_square(self.colour_bitboards[colour_index], square_index)
+
+                if piece_type == Piece.King:
+                    self.king_square[colour_index] = square_index
+
+
+
