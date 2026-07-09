@@ -1,0 +1,316 @@
+import numpy as np
+import pandas as pd
+
+# =====================================================================
+# STUBS & COORD SUPPORT
+# =====================================================================
+class Board:
+    WhiteIndex = 0
+    BlackIndex = 1
+
+class BoardHelper:
+    @staticmethod
+    def file_index(square): return square % 8
+    @staticmethod
+    def rank_index(square): return square // 8
+    @staticmethod
+    def index_from_coord(file, rank): return rank * 8 + file
+
+class Coord:
+    def __init__(self, square_index_or_file, rank_index=None):
+        if rank_index is None:
+            self.file_index = square_index_or_file % 8
+            self.rank_index = square_index_or_file // 8
+        else:
+            self.file_index = square_index_or_file
+            self.rank_index = rank_index
+
+    def is_valid_square(self):
+        return 0 <= self.file_index < 8 and 0 <= self.rank_index < 8
+
+    @property
+    def square_index(self):
+        return self.rank_index * 8 + self.file_index
+
+
+# =====================================================================
+# STRUCTURAL EVALUATION DATA RECORD
+# =====================================================================
+class EvaluationData:
+    def __init__(self):
+        self.material_score = 0
+        self.mop_up_score = 0
+        self.piece_square_score = 0
+        self.pawn_score = 0
+        self.pawn_shield_score = 0
+
+    def sum(self):
+        return (self.material_score + self.mop_up_score + 
+                self.piece_square_score + self.pawn_score + self.pawn_shield_score)
+
+    def to_dict(self):
+        return {
+            "material": self.material_score,
+            "mop_up": self.mop_up_score,
+            "piece_square": self.piece_square_score,
+            "pawns": self.pawn_score,
+            "pawn_shield": self.pawn_shield_score,
+            "total": self.sum()
+        }
+
+
+# =====================================================================
+# 📊 MATERIAL CONTEXT STRUCTURE (With Phase Transition Tracking)
+# =====================================================================
+class MaterialInfo:
+    """Structures material weights and tracks game-phase decay."""
+    def __init__(self, num_pawns, num_knights, num_bishops, num_queens, num_rooks, my_pawns, enemy_pawns, eval_instance):
+        self.num_pawns = num_pawns
+        self.num_bishops = num_bishops
+        self.num_queens = num_queens
+        self.num_rooks = num_rooks
+        self.pawns = my_pawns
+        self.enemy_pawns = enemy_pawns
+
+        self.num_majors = num_rooks + num_queens
+        self.num_minors = num_bishops + num_knights
+
+        # Accumulate absolute baseline values
+        self.material_score = (
+            num_pawns * eval_instance.PawnValue +
+            num_knights * eval_instance.KnightValue +
+            num_bishops * eval_instance.BishopValue +
+            num_rooks * eval_instance.RookValue +
+            num_queens * eval_instance.QueenValue
+        )
+
+        # Non-linear Game Phase Weights (0.0 = Opening, 1.0 = Clean Endgame)
+        queen_weight, rook_weight, bishop_weight, knight_weight = 45, 20, 10, 10
+        endgame_start_weight = 2 * rook_weight + 2 * bishop_weight + 2 * knight_weight + queen_weight
+        
+        weight_sum = (num_queens * queen_weight + num_rooks * rook_weight + 
+                      num_bishops * bishop_weight + num_knights * knight_weight)
+        
+        self.endgame_t = 1.0 - min(1.0, weight_sum / float(endgame_start_weight))
+
+
+# =====================================================================
+# 🧩 POSITION MATRIX (Piece-Square Tables Vectorized via NumPy)
+# =====================================================================
+class PieceSquareTable:
+    Pawns = [
+         0,   0,   0,   0,   0,   0,   0,   0,
+        50,  50,  50,  50,  50,  50,  50,  50,
+        10,  10,  20,  30,  30,  20,  10,  10,
+         5,   5,  10,  25,  25,  10,   5,   5,
+         0,   0,   0,  20,  20,   0,   0,   0,
+         5,  -5, -10,   0,   0, -10,  -5,   5,
+         5,  10,  10, -20, -20,  10,  10,   5,
+         0,   0,   0,   0,   0,   0,   0,   0
+    ]
+    PawnsEnd = [
+         0,   0,   0,   0,   0,   0,   0,   0,
+        80,  80,  80,  80,  80,  80,  80,  80,
+        50,  50,  50,  50,  50,  50,  50,  50,
+        30,  30,  30,  30,  30,  30,  30,  30,
+        20,  20,  20,  20,  20,  20,  20,  20,
+        10,  10,  10,  10,  10,  10,  10,  10,
+        10,  10,  10,  10,  10,  10,  10,  10,
+         0,   0,   0,   0,   0,   0,   0,   0
+    ]
+    Rooks = [
+         0,   0,   0,   0,   0,   0,   0,   0,
+         5,  10,  10,  10,  10,  10,  10,   5,
+        -5,   0,   0,   0,   0,   0,   0,  -5,
+        -5,   0,   0,   0,   0,   0,   0,  -5,
+        -5,   0,   0,   0,   0,   0,   0,  -5,
+        -5,   0,   0,   0,   0,   0,   0,  -5,
+        -5,   0,   0,   0,   0,   0,   0,  -5,
+         0,   0,   0,   5,   5,   0,   0,   0
+    ]
+    Knights = [
+        -50,-40,-30,-30,-30,-30,-40,-50,
+        -40,-20,  0,  0,  0,  0,-20,-40,
+        -30,  0, 10, 15, 15, 10,  0,-30,
+        -30,  5, 15, 20, 20, 15,  5,-30,
+        -30,  0, 15, 20, 20, 15,  0,-30,
+        -30,  5, 10, 15, 15, 10,  5,-30,
+        -40,-20,  0,  5,  5,  0,-20,-40,
+        -50,-40,-30,-30,-30,-30,-40,-50,
+    ]
+    Bishops = [
+        -20,-10,-10,-10,-10,-10,-10,-20,
+        -10,  0,  0,  0,  0,  0,  0,-10,
+        -10,  0,  5, 10, 10,  5,  0,-10,
+        -10,  5,  5, 10, 10,  5,  5,-10,
+        -10,  0, 10, 10, 10, 10,  0,-10,
+        -10, 10, 10, 10, 10, 10, 10,-10,
+        -10,  5,  0,  0,  0,  0,  5,-10,
+        -20,-10,-10,-10,-10,-10,-10,-20,
+    ]
+    Queens = [
+        -20,-10,-10, -5, -5,-10,-10,-20,
+        -10,  0,  0,  0,  0,  0,  0,-10,
+        -10,  0,  5,  5,  5,  5,  0,-10,
+         -5,  0,  5,  5,  5,  5,  0,  -5,
+          0,  0,  5,  5,  5,  5,  0,  -5,
+        -10,  5,  5,  5,  5,  5,  0,-10,
+        -10,  0,  5,  0,  0,  0,  0,-10,
+        -20,-10,-10, -5, -5,-10,-10,-20
+    ]
+    KingStart = [
+        -80, -70, -70, -70, -70, -70, -70, -80, 
+        -60, -60, -60, -60, -60, -60, -60, -60, 
+        -40, -50, -50, -60, -60, -50, -50, -40, 
+        -30, -40, -40, -50, -50, -40, -40, -30, 
+        -20, -30, -30, -40, -40, -30, -30, -20, 
+        -10, -20, -20, -20, -20, -20, -20, -10, 
+         20,  20,  -5,  -5,  -5,  -5,  20,  20, 
+         20,  30,  10,   0,   0,  10,  30,  20
+    ]
+    KingEnd = [
+        -20, -10, -10, -10, -10, -10, -10, -20,
+         -5,   0,   5,   5,   5,   5,   0,  -5,
+        -10,  -5,  20,  30,  30,  20,  -5, -10,
+        -15, -10,  35,  45,  45,  35, -10, -15,
+        -20, -15,  30,  40,  40,  30, -15, -20,
+        -25, -20,  20,  25,  25,  20, -20, -25,
+        -30, -25,   0,   0,   0,   0, -25, -30,
+        -50, -30, -30, -30, -30, -30, -30, -50
+    ]
+
+    # Storing tables into a unified lookup array for quick execution
+    tables_map = {}
+
+    @classmethod
+    def initialize_tables(cls, piece_class):
+        def get_flipped_table(table):
+            flipped = [0] * 64
+            for idx in range(64):
+                c = Coord(idx)
+                flipped_coord = Coord(c.file_index, 7 - c.rank_index)
+                flipped[flipped_coord.square_index] = table[idx]
+            return flipped
+
+        # Map white arrays
+        cls.tables_map[(piece_class.Pawn, True)] = cls.Pawns
+        cls.tables_map[(piece_class.Rook, True)] = cls.Rooks
+        cls.tables_map[(piece_class.Knight, True)] = cls.Knights
+        cls.tables_map[(piece_class.Bishop, True)] = cls.Bishops
+        cls.tables_map[(piece_class.Queen, True)] = cls.Queens
+
+        # Map black arrays mirrored across ranks
+        cls.tables_map[(piece_class.Pawn, False)] = get_flipped_table(cls.Pawns)
+        cls.tables_map[(piece_class.Rook, False)] = get_flipped_table(cls.Rooks)
+        cls.tables_map[(piece_class.Knight, False)] = get_flipped_table(cls.Knights)
+        cls.tables_map[(piece_class.Bishop, False)] = get_flipped_table(cls.Bishops)
+        cls.tables_map[(piece_class.Queen, False)] = get_flipped_table(cls.Queens)
+
+    @classmethod
+    def read(cls, table_array, square, is_white):
+        if is_white:
+            file = BoardHelper.file_index(square)
+            rank = 7 - BoardHelper.rank_index(square)
+            square = BoardHelper.index_from_coord(file, rank)
+        return table_array[square]
+
+
+# =====================================================================
+# KING PROTECTION MATRIX (Precomputed Shield Offsets)
+# =====================================================================
+class PrecomputedEvaluationData:
+    PawnShieldSquaresWhite = [[] for _ in range(64)]
+    PawnShieldSquaresBlack = [[] for _ in range(64)]
+
+    @classmethod
+    def initialize_shield_arrays(cls):
+        for sq in range(64):
+            shield_white = []
+            shield_black = []
+            coord = Coord(sq)
+            rank = coord.rank_index
+            file = np.clip(coord.file_index, 1, 6)
+
+            # Row offsets +1 / -1
+            for file_offset in range(-1, 2):
+                c_w = Coord(file + file_offset, rank + 1)
+                c_b = Coord(file + file_offset, rank - 1)
+                if c_w.is_valid_square(): shield_white.append(c_w.square_index)
+                if c_b.is_valid_square(): shield_black.append(c_b.square_index)
+
+            # Row offsets +2 / -2
+            for file_offset in range(-1, 2):
+                c_w = Coord(file + file_offset, rank + 2)
+                c_b = Coord(file + file_offset, rank - 2)
+                if c_w.is_valid_square(): shield_white.append(c_w.square_index)
+                if c_b.is_valid_square(): shield_black.append(c_b.square_index)
+
+            cls.PawnShieldSquaresWhite[sq] = shield_white
+            cls.PawnShieldSquaresBlack[sq] = shield_black
+
+
+# Initialize precomputations immediately on import
+PrecomputedEvaluationData.initialize_shield_arrays()
+
+
+# =====================================================================
+# MAIN EVALUATION LAYER
+# =====================================================================
+class Evaluation:
+    PawnValue = 100
+    KnightValue = 300
+    BishopValue = 320
+    RookValue = 500
+    QueenValue = 900
+
+    passed_pawn_bonuses = [0, 120, 80, 50, 30, 15, 15]
+    isolated_pawn_penalty_by_count = [0, -10, -25, -50, -75, -75, -75, -75, -75]
+    king_pawn_shield_scores = [4, 7, 4, 3, 6, 3]
+    endgame_material_start = RookValue * 2 + BishopValue + KnightValue
+
+    def __init__(self):
+        self.board = None
+        self.white_eval = EvaluationData()
+        self.black_eval = EvaluationData()
+        self.evaluation_history = []
+
+    def get_material_info(self, colour_index):
+        """Constructs and extracts full material analytics frames from current board state."""
+        num_pawns = len(self.board.pawns[colour_index])
+        num_knights = len(self.board.knights[colour_index])
+        num_bishops = len(self.board.bishops[colour_index])
+        num_rooks = len(self.board.rooks[colour_index])
+        num_queens = len(self.board.queens[colour_index])
+
+        is_white = (colour_index == Board.WhiteIndex)
+        my_pawns = self.board.piece_bitboards[Piece.make_piece(Piece.Pawn, is_white)]
+        enemy_pawns = self.board.piece_bitboards[Piece.make_piece(Piece.Pawn, not is_white)]
+
+        return MaterialInfo(num_pawns, num_knights, num_bishops, num_queens, num_rooks, my_pawns, enemy_pawns, self)
+
+    def evaluate_piece_square_tables(self, is_white, endgame_t):
+        """Calculates blended matrix positioning tables."""
+        value = 0
+        colour_index = Board.WhiteIndex if is_white else Board.BlackIndex
+        
+        value += self.evaluate_piece_square_table(PieceSquareTable.Rooks, self.board.rooks[colour_index], is_white)
+        value += self.evaluate_piece_square_table(PieceSquareTable.Knights, self.board.knights[colour_index], is_white)
+        value += self.evaluate_piece_square_table(PieceSquareTable.Bishops, self.board.bishops[colour_index], is_white)
+        value += self.evaluate_piece_square_table(PieceSquareTable.Queens, self.board.queens[colour_index], is_white)
+
+        pawn_early = self.evaluate_piece_square_table(PieceSquareTable.Pawns, self.board.pawns[colour_index], is_white)
+        pawn_late = self.evaluate_piece_square_table(PieceSquareTable.PawnsEnd, self.board.pawns[colour_index], is_white)
+        value += int(pawn_early * (1.0 - endgame_t)) + int(pawn_late * endgame_t)
+
+        king_early_phase = PieceSquareTable.read(PieceSquareTable.KingStart, self.board.king_square[colour_index], is_white)
+        king_late_phase = PieceSquareTable.read(PieceSquareTable.KingEnd, self.board.king_square[colour_index], is_white)
+        value += int(king_early_phase * (1.0 - endgame_t)) + int(king_late_phase * endgame_t)
+
+        return value
+
+    def evaluate_piece_square_table(self, table, piece_list, is_white):
+        value = 0
+        for i in range(len(piece_list)):
+            value += PieceSquareTable.read(table, piece_list[i], is_white)
+        return value
+
