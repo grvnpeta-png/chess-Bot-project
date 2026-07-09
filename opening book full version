@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import json
+import pandas as pd  # <-- Integrated for structural analytics
 from typing import Dict, List, Tuple, Optional, Any, Union
 
 class BookMove:
@@ -121,6 +122,27 @@ class OpeningBook:
         kurt = np.mean(((w - mean) / std_dev) ** 4) if len(w) > 3 else 0.0
         return {"mean": float(mean), "std_dev": float(std_dev), "skewness": float(skew), "kurtosis": float(kurt)}
 
+    def generate_pandas_book_profile(self) -> pd.DataFrame:
+        """Transforms structural opening data matrices into a flat Pandas DataFrame for summary analysis."""
+        records = []
+        for fen, moves in self.moves_by_position.items():
+            stats = self.compute_distribution_descriptive_stats(fen)
+            w = self.weight_matrix_cache[fen]
+            r = self.rating_matrix_cache[fen]
+            records.append({
+                "position_fen": fen,
+                "node_hash": self.position_bit_masks[fen],
+                "total_move_options": len(moves),
+                "total_play_count": float(np.sum(w)),
+                "weight_mean": stats["mean"],
+                "weight_std": stats["std_dev"],
+                "weight_skew": stats["skewness"],
+                "weight_kurt": stats["kurtosis"],
+                "max_rating": float(np.max(r)) if len(r) > 0 else 0.0,
+                "min_rating": float(np.min(r)) if len(r) > 0 else 0.0
+            })
+        return pd.DataFrame(records)
+
     def dynamic_z_score_pruning(self, threshold_z: float = -1.5) -> None:
         keys_to_delete = []
         for fen, moves in self.moves_by_position.items():
@@ -168,6 +190,14 @@ class OpeningBook:
         scaled_expected = p_exp * sum_obs
         chi_stat = np.sum(((observed_counts - scaled_expected) ** 2) / (scaled_expected + 1e-9))
         return float(chi_stat), bool(chi_stat < 3.84)
+
+    def compute_positional_covariance_matrix(self, fen: str) -> np.ndarray:
+        std = self._remove_move_counters_from_fen(fen)
+        if std not in self.moves_by_position: return np.zeros((2, 2))
+        moves = self.moves_by_position[std]
+        stacked = np.array([[m.num_times_played, m.performance_rating] for m in moves], dtype=np.float64)
+        if len(stacked) <= 1: return np.zeros((2, 2))
+        return np.cov(stacked, rowvar=False)
 
     def merge_distributions(self, target_book: 'OpeningBook') -> None:
         for fen, moves in target_book.moves_by_position.items():
