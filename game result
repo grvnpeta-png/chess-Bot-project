@@ -1,0 +1,238 @@
+from enum import Enum
+import pandas as pd
+import numpy as np
+
+# =====================================================================
+# 📊 GAME RESULT CATEGORICAL ENUM
+# =====================================================================
+class GameResult(Enum):
+    NotStarted = 0
+    InProgress = 1
+    WhiteIsMated = 2
+    BlackIsMated = 3
+    Stalemate = 4
+    Repetition = 5
+    FiftyMoveRule = 6
+    InsufficientMaterial = 7
+    DrawByArbiter = 8
+    WhiteTimeout = 9
+    BlackTimeout = 10
+    WhiteIllegalMove = 11
+    BlackIllegalMove = 12
+
+
+# =====================================================================
+# 🧭 MOVE STRUCT OBJECT PROPERTIES
+# =====================================================================
+class Move:
+    NoFlag = 0
+    PawnTwoUpFlag = 1
+    EnPassantCaptureFlag = 2
+    CastleFlag = 3
+    PromoteToQueenFlag = 4
+    PromoteToRookFlag = 5
+    PromoteToKnightFlag = 6
+    PromoteToBishopFlag = 7
+
+    def __init__(self, start_square: int, target_square: int, flag: int = 0):
+        self.start_square = start_square
+        self.target_square = target_square
+        self.move_flag = flag
+
+    @property
+    def is_null(self) -> bool:
+        return self.start_square == 0 and self.target_square == 0
+
+
+# =====================================================================
+# 📦 COMPLETE ENGINE BOARD LAYOUT REPRESENTATION
+# =====================================================================
+class Board:
+    WhiteIndex = 0
+    BlackIndex = 1
+
+    def __init__(self):
+        # Piece tracking lists matching the C# index lists
+        self.pawns = [[], []]
+        self.knights = [[], []]
+        self.bishops = [[], []]
+        self.rooks = [[], []]
+        self.queens = [[], []]
+        self.king_square = [0, 0]
+        
+        self.is_white_to_move = True
+        self.fifty_move_counter = 0
+        self.zobrist_key = 0
+        self.repetition_position_history = []
+        
+        # Bitboards representing orthogonal sliders (Rooks / Queens combined)
+        self.friendly_orthogonal_sliders = 0
+        self.enemy_orthogonal_sliders = 0
+
+    def update_slider_bitboards(self):
+        """Recomputes orthogonal sliding bitboards based on active pieces."""
+        self.friendly_orthogonal_sliders = 0
+        self.enemy_orthogonal_sliders = 0
+        
+        # White Sliders
+        for r in self.rooks[0]: self.friendly_orthogonal_sliders |= (1 << r)
+        for q in self.queens[0]: self.friendly_orthogonal_sliders |= (1 << q)
+        
+        # Black Sliders
+        for r in self.rooks[1]: self.enemy_orthogonal_sliders |= (1 << r)
+        for q in self.queens[1]: self.enemy_orthogonal_sliders |= (1 << q)
+
+
+# =====================================================================
+# 🗺️ BOARD HELPER MATRIX PROTOCOLS (Coordinate Translators)
+# =====================================================================
+class BoardHelper:
+    file_names = "abcdefgh"
+    rank_names = "12345678"
+
+    @staticmethod
+    def rank_index(square_index: int) -> int:
+        return square_index >> 3
+
+    @staticmethod
+    def file_index(square_index: int) -> int:
+        return square_index & 0b000111
+
+    @staticmethod
+    def index_from_coord(file_index: int, rank_index: int) -> int:
+        return (rank_index * 8) + file_index
+
+    @staticmethod
+    def light_square(square_index: int) -> bool:
+        """Determines if a given square index belongs to the light color complex."""
+        file = square_index & 0b111
+        rank = square_index >> 3
+        return (file + rank) % 2 != 0
+
+
+# =====================================================================
+# ⚖️ MAIN GAME STATE ARBITER MATCH VALIDATOR
+# =====================================================================
+class Arbiter:
+    @staticmethod
+    def is_draw_result(result: GameResult) -> bool:
+        """Returns True if the game state code corresponds to a legal draw state."""
+        return result in (
+            GameResult.DrawByArbiter, 
+            GameResult.FiftyMoveRule,
+            GameResult.Repetition, 
+            GameResult.Stalemate, 
+            GameResult.InsufficientMaterial
+        )
+
+    @staticmethod
+    def is_win_result(result: GameResult) -> bool:
+        """Returns True if the result represents a definitive win for either side."""
+        return Arbiter.is_white_wins_result(result) or Arbiter.is_black_wins_result(result)
+
+    @staticmethod
+    def is_white_wins_result(result: GameResult) -> bool:
+        """Returns True if White achieved victory by checkmate, timeout, or penalties."""
+        return result in (GameResult.BlackIsMated, GameResult.BlackTimeout, GameResult.BlackIllegalMove)
+
+    @staticmethod
+    def is_black_wins_result(result: GameResult) -> bool:
+        """Returns True if Black achieved victory by checkmate, timeout, or penalties."""
+        return result in (GameResult.WhiteIsMated, GameResult.WhiteTimeout, GameResult.WhiteIllegalMove)
+
+    @staticmethod
+    def get_game_state(board: Board, move_generator) -> GameResult:
+        """
+        Main structural arbiter check. Assesses the match rules to evaluate
+        if processing needs to be terminated or skipped.
+        """
+        moves = move_generator.generate_moves(board)
+
+        # 1. Look for Checkmate or Stalemate conditions
+        if len(moves) == 0:
+            if move_generator.in_check():
+                return GameResult.WhiteIsMated if board.is_white_to_move else GameResult.BlackIsMated
+            return GameResult.Stalemate
+
+        # 2. Fifty Move Rule Verification (100 half-moves/plies threshold)
+        if board.fifty_move_counter >= 100:
+            return GameResult.FiftyMoveRule
+
+        # 3. Threefold Repetition Count Validation
+        rep_count = sum(1 for x in board.repetition_position_history if x == board.zobrist_key)
+        if rep_count == 3:
+            return GameResult.Repetition
+
+        # 4. Check for Dead Position configurations (Insufficient Material)
+        if Arbiter.insufficient_material(board):
+            return GameResult.InsufficientMaterial
+
+        return GameResult.InProgress
+
+    @staticmethod
+    def insufficient_material(board: Board) -> bool:
+        """Applies positional filtering maps to declare inevitable draws due to lack of material."""
+        # Active pawn units on board bypass insufficient material immediately
+        if len(board.pawns[Board.WhiteIndex]) > 0 or len(board.pawns[Board.BlackIndex]) > 0:
+            return False
+
+        # Structural sliding pieces (Rooks/Queens) retain forced mating matrices
+        if board.friendly_orthogonal_sliders != 0 or board.enemy_orthogonal_sliders != 0:
+            return False
+
+        # Extract minor volumes across colors
+        num_white_bishops = len(board.bishops[Board.WhiteIndex])
+        num_black_bishops = len(board.bishops[Board.BlackIndex])
+        num_white_knights = len(board.knights[Board.WhiteIndex])
+        num_black_knights = len(board.knights[Board.BlackIndex])
+
+        num_white_minors = num_white_bishops + num_white_knights
+        num_black_minors = num_black_bishops + num_black_knights
+        num_minors = num_white_minors + num_black_minors
+
+        # Kings alone, King + Bishop vs King, or King + Knight vs King
+        if num_minors <= 1:
+            return True
+
+        # Unique Matrix Event: Exactly 1 Bishop per side. Check color complex identity.
+        if num_minors == 2 and num_white_bishops == 1 and num_black_bishops == 1:
+            white_bishop_square = board.bishops[Board.WhiteIndex][0]
+            black_bishop_square = board.bishops[Board.BlackIndex][0]
+            
+            white_bishop_is_light = BoardHelper.light_square(white_bishop_square)
+            black_bishop_is_light = BoardHelper.light_square(black_bishop_square)
+            
+            # True draw if both bishops are bound to the identical square color complex
+            return white_bishop_is_light == black_bishop_is_light
+
+        return False
+
+
+# =====================================================================
+# 📈 TOURNAMENT ANALYTICS PIPELINE (Data Science Logging Core)
+# =====================================================================
+class EngineAnalyticsPipeline:
+    """Collects game termination outcomes across testing phases into structural tables."""
+    def __init__(self):
+        self.match_history = []
+
+    def log_termination(self, match_id: int, result: GameResult, ply_depth: int):
+        self.match_history.append({
+            "match_id": match_id,
+            "termination_reason": result.name,
+            "is_draw": Arbiter.is_draw_result(result),
+            "white_victory": Arbiter.is_white_wins_result(result),
+            "black_victory": Arbiter.is_black_wins_result(result),
+            "total_plies": ply_depth
+        })
+
+    def export_summary_metrics(self) -> pd.DataFrame:
+        """Summarizes structural engine results into clean statistical series."""
+        if not self.match_history:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(self.match_history)
+        print("\n=== 📊 TOURNAMENT PIPELINE TERMINATION AGGREGATIONS ===")
+        print(df.groupby("termination_reason")["total_plies"].agg(["count", "mean", "max"]))
+        return df
+
