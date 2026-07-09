@@ -1,0 +1,444 @@
+import time
+import numpy as np
+import pandas as pd  # <-- Integrated for engine diagnostics auditing
+from typing import Tuple, Optional, Any, Callable, List, Dict
+
+from Board.board_state import Board
+from Move_Generation.move_generator import MoveGenerator, Move
+from Evaluation.evaluation import Evaluation
+
+class SearchDiagnostics:
+    __slots__ = ['move', 'eval', 'moveIsFromPartialSearch', 'numCompletedIterations', 'numCutOffs', 'numPositionsEvaluated', 'nodes_per_second', 'sel_depth', 'history_efficiency', 'branching_history_vector', 'fail_high_first_matrix', 'depth_eval_variance_matrix', 'iteration_telemetry_logs']
+    def __init__(self) -> None:
+        self.move: str = "None"
+        self.eval: int = 0
+        self.moveIsFromPartialSearch: bool = False
+        self.numCompletedIterations: int = 0
+        self.numCutOffs: int = 0
+        self.numPositionsEvaluated: int = 0
+        self.nodes_per_second: float = 0.0
+        self.sel_depth: int = 0
+        self.history_efficiency: float = 0.0
+        self.branching_history_vector = np.zeros(100, dtype=np.float64)
+        self.fail_high_first_matrix = np.zeros((2, 100), dtype=np.float64)
+        self.depth_eval_variance_matrix = np.zeros((256, 2), dtype=np.float64)
+        self.iteration_telemetry_logs: List[Dict[str, Any]] = []
+
+    def export_telemetry_dataframe(self) -> pd.DataFrame:
+        """Packages iteration diagnostic logs into a Pandas DataFrame for telemetry visualization."""
+        return pd.DataFrame(self.iteration_telemetry_logs)
+
+class TimeManager:
+    __slots__ = ['start_time', 'allocated_time', 'hard_limit', 'search_cancelled', 'time_control_matrix']
+    def __init__(self) -> None:
+        self.start_time: float = 0.0
+        self.allocated_time: float = 0.0
+        self.hard_limit: float = 0.0
+        self.search_cancelled: bool = False
+        self.time_control_matrix = np.zeros(4, dtype=np.float64)
+
+    def init_timer(self, remaining_time_ms: float, increment_ms: float, moves_to_go: int = 0) -> None:
+        self.start_time = time.perf_counter()
+        self.search_cancelled = False
+        est_moves = moves_to_go if moves_to_go > 0 else 30
+        base_time = remaining_time_ms / est_moves
+        self.allocated_time = (base_time + increment_ms * 0.8) / 1000.0
+        self.hard_limit = min(self.allocated_time * 4.0, (remaining_time_ms * 0.5) / 1000.0)
+        self.time_control_matrix[0] = self.start_time
+        self.time_control_matrix[1] = self.allocated_time
+        self.time_control_matrix[2] = self.hard_limit
+
+    def check_time_limits(self) -> bool:
+        if self.search_cancelled: return True
+        if time.perf_counter() - self.start_time >= self.allocated_time:
+            self.search_cancelled = True
+            return True
+        return False
+
+class RepetitionTable:
+    def __init__(self, capacity: int = 256) -> None:
+        self.hashes = np.zeros(capacity, dtype=np.uint64)
+        self.start_indices = np.zeros(capacity + 1, dtype=np.int32)
+        self.bit_history_vector = np.zeros(capacity, dtype=np.uint32)
+        self.count: int = 0
+
+    def initialize_history(self, history_hashes: List[int]) -> None:
+        self.count = min(len(history_hashes), len(self.hashes))
+        for i in range(self.count):
+            self.hashes[i] = np.uint64(history_hashes[i])
+            self.start_indices[i] = 0
+        self.start_indices[self.count] = 0
+
+    def push(self, position_hash: int, resets_clock: bool) -> None:
+        if self.count < len(self.hashes):
+            self.hashes[self.count] = np.uint64(position_hash)
+            self.start_indices[self.count + 1] = self.count if resets_clock else self.start_indices[self.count]
+            self.bit_history_vector[self.count] = int(position_hash & 0xFFFFFFFF)
+        self.count += 1
+
+    def try_pop(self) -> None:
+        if self.count > 0: self.count -= 1
+
+    def contains(self, position_hash: int) -> bool:
+        if self.count <= 1: return False
+        t_hash = np.uint64(position_hash)
+        for i in range(self.start_indices[self.count], self.count - 1):
+            if self.hashes[i] == t_hash: return True
+        return False
+
+class Killers:
+    __slots__ = ['move_a_val', 'move_b_val', 'hit_counters']
+    def __init__(self) -> None:
+        self.move_a_val: Optional[int] = None
+        self.move_b_val: Optional[int] = None
+        self.hit_counters = np.zeros(2, dtype=np.int32)
+
+    def add(self, move_val: int) -> None:
+        if move_val != self.move_a_val:
+            self.move_b_val = self.move_a_val
+            self.move_a_val = move_val
+            self.hit_counters[1] = self.hit_counters[0]
+            self.hit_counters[0] = 1
+        else:
+            self.hit_counters[0] += 1
+
+    def match(self, move_val: int) -> bool:
+        return move_val == self.move_a_val or move_val == self.move_b_val
+
+class MoveOrdering:
+    MAX_MOVE_COUNT = 218
+    MAX_KILLER_MOVE_PLY = 32
+    MILLION = 1000000
+    HASH_MOVE_SCORE = 100 * MILLION
+    WINNING_CAPTURE_BIAS = 8 * MILLION
+    PROMOTE_BIAS = 6 * MILLION
+    KILLER_BIAS = 4 * MILLION
+    LOSING_CAPTURE_BIAS = 2 * MILLION
+
+    def __init__(self) -> None:
+        self.move_scores = np.zeros(self.MAX_MOVE_COUNT, dtype=np.int32)
+        self.killer_moves = [Killers() for _ in range(self.MAX_KILLER_MOVE_PLY)]
+        self.history = np.zeros((2, 64, 64), dtype=np.int32)
+        self.counter_move_matrix = np.zeros((64, 64), dtype=np.int32)
+        self.relative_butterfly_table = np.zeros((64, 64), dtype=np.int32)
+
+    def clear_structures(self) -> None:
+        self.killer_moves = [Killers() for _ in range(self.MAX_KILLER_MOVE_PLY)]
+        self.history.fill(0)
+        self.counter_move_matrix.fill(0)
+        self.relative_butterfly_table.fill(0)
+
+    def order_moves(self, hash_move_val: Optional[int], board: Board, moves: List[Move], opp_atk: int, opp_pawn_atk: int, in_q: bool, ply: int) -> None:
+        n_moves = len(moves)
+        self.move_scores.fill(0)
+        c_idx = board.move_colour_index
+        
+        for i in range(n_moves):
+            m = moves[i]
+            m_val = (m.start_square | (m.target_square << 6) | (m.move_flag << 12))
+            if hash_move_val is not None and m_val == hash_move_val:
+                self.move_scores[i] = self.HASH_MOVE_SCORE
+                continue
+            
+            sc = 0
+            start, target = m.start_square, m.target_square
+            moving_p = board.square[start] & 7
+            cap_p = board.square[target] & 7
+            
+            if cap_p != 0:
+                sc += self.WINNING_CAPTURE_BIAS + (cap_p * 1000) - moving_p
+            else:
+                if moving_p == 1 and m.move_flag == 4: sc += self.PROMOTE_BIAS
+                if not in_q and ply < self.MAX_KILLER_MOVE_PLY and self.killer_moves[ply].match(m_val): sc += self.KILLER_BIAS
+                sc += self.history[c_idx, start, target]
+                if self.counter_move_matrix[start, target] != 0: sc += 1000
+                sc += self.relative_butterfly_table[start, target]
+            self.move_scores[i] = sc
+            self.relative_butterfly_table[start, target] += 1
+        self._quicksort(moves, 0, n_moves - 1)
+
+    def _quicksort(self, moves: List[Move], low: int, high: int) -> None:
+        if low < high:
+            p = self._partition(moves, low, high)
+            self._quicksort(moves, low, p - 1)
+            self._quicksort(moves, p + 1, high)
+
+    def _partition(self, moves: List[Move], low: int, high: int) -> int:
+        pivot = self.move_scores[high]
+        i = low - 1
+        for j in range(low, high):
+            if self.move_scores[j] > pivot:
+                i += 1
+                moves[i], moves[j] = moves[j], moves[i]
+                self.move_scores[i], self.move_scores[j] = self.move_scores[j], self.move_scores[i]
+        moves[i+1], moves[high] = moves[high], moves[i+1]
+        self.move_scores[i+1], self.move_scores[high] = self.move_scores[high], self.move_scores[i+1]
+        return i + 1
+
+class TTEntry:
+    __slots__ = ['zobrist_key', 'value', 'depth', 'node_type', 'best_move', 'age_tick']
+    def __init__(self) -> None:
+        self.zobrist_key: np.uint64 = np.uint64(0)
+        self.value: int = 0
+        self.depth: int = 0
+        self.node_type: int = 0
+        self.best_move: Any = None
+        self.age_tick: int = 0
+
+class TranspositionTable:
+    EXACT, LOWER_BOUND, UPPER_BOUND = 0, 1, 2
+    LOOKUP_FAILED = -99999999
+    IMMEDIATE_MATE_SCORE = 100000
+
+    def __init__(self, size_mb: int = 64) -> None:
+        n_slots = (size_mb * 1024 * 1024) // 40
+        self.num_entries = 1 << (n_slots - 1).bit_length()
+        self.hash_mask = self.num_entries - 1
+        self.table = [TTEntry() for _ in range(self.num_entries)]
+        self.current_index: int = 0
+        self._active_key: int = 0
+        self.global_age: int = 0
+
+    def lookup_evaluation(self, depth: int, ply: int, alpha: int, beta: int) -> int:
+        self.current_index = int(np.uint64(self._active_key) & np.uint64(self.hash_mask))
+        entry = self.table[self.current_index]
+        if entry.zobrist_key == np.uint64(self._active_key):
+            val = entry.value
+            if abs(val) > self.IMMEDIATE_MATE_SCORE - 1000:
+                val = (val * (1 if val > 0 else -1) + ply) * (1 if val > 0 else -1)
+            if entry.depth >= depth:
+                if entry.node_type == self.EXACT: return val
+                if entry.node_type == self.UPPER_BOUND and val <= alpha: return alpha
+                if entry.node_type == self.LOWER_BOUND and val >= beta: return beta
+        return self.LOOKUP_FAILED
+
+    def store_evaluation(self, depth: int, ply: int, value: int, node_type: int, best_move: Any) -> None:
+        idx = int(np.uint64(self._active_key) & np.uint64(self.hash_mask))
+        entry = self.table[idx]
+        if abs(value) > self.IMMEDIATE_MATE_SCORE - 1000:
+            value = (value * (1 if value > 0 else -1) - ply) * (1 if value > 0 else -1)
+        entry.zobrist_key = np.uint64(self._active_key)
+        entry.value = value
+        entry.depth = depth
+        entry.node_type = node_type
+        entry.best_move = best_move
+        entry.age_tick = self.global_age
+
+    def try_get_stored_move(self) -> Optional[Any]:
+        entry = self.table[self.current_index]
+        return entry.best_move if entry.zobrist_key == np.uint64(self._active_key) else None
+
+    @property
+    def board_zobrist_key_placeholder(self) -> int: return self._active_key
+    @board_zobrist_key_placeholder.setter
+    def board_zobrist_key_placeholder(self, v: int) -> None: self._active_key = v
+
+class Searcher:
+    TRANSPOSITION_TABLE_SIZE_MB = 64
+    MAX_EXTENSIONS = 16
+    IMMEDIATE_MATE_SCORE = 100000
+    POSITIVE_INFINITY, NEGATIVE_INFINITY = 9999999, -9999999
+
+    def __init__(self, board: Board) -> None:
+        self.board = board
+        self.evaluation = Evaluation()
+        self.moveGenerator = MoveGenerator()
+        self.transpositionTable = TranspositionTable(self.TRANSPOSITION_TABLE_SIZE_MB)
+        self.moveOrderer = MoveOrdering()
+        self.repetitionTable = RepetitionTable()
+        self.timeManager = TimeManager()
+        self.CurrentDepth: int = 0
+        self.searchCancelled: bool = False
+        self.hasSearchedAtLeastOneMove: bool = False
+        self.bestMove: Optional[Move] = None
+        self.bestEval: int = 0
+        self.bestMoveThisIteration: Optional[Move] = None
+        self.bestEvalThisIteration: int = 0
+        self.searchDiagnostics = SearchDiagnostics()
+        self.root_moves_scores: Dict[int, int] = {}
+        self.dynamic_alpha_beta_bounds = np.zeros((2, 256), dtype=np.int32)
+        self._search(1, 0, self.NEGATIVE_INFINITY, self.POSITIVE_INFINITY)
+
+    def start_search(self, remaining_time_ms: float, increment_ms: float, callback: Optional[Callable[[Any], None]] = None) -> None:
+        self.bestEvalThisIteration = self.bestEval = 0
+        self.bestMoveThisIteration = self.bestMove = None
+        self.moveOrderer.clear_structures()
+        self.repetitionTable.initialize_history([])
+        self.searchCancelled = False
+        self.searchDiagnostics = SearchDiagnostics()
+        self.transpositionTable.global_age += 1
+        self.timeManager.init_timer(remaining_time_ms, increment_ms)
+        
+        t_start = time.perf_counter()
+        self._run_iterative_deepening_search()
+        t_dur = time.perf_counter() - t_start
+        
+        self.update_root_telemetry_metrics(t_dur)
+        if self.bestMove is None:
+            f_back = self.moveGenerator.generate_moves(self.board)
+            if f_back: self.bestMove = f_back[0]
+        if callback: callback(self.bestMove)
+
+    def _run_iterative_deepening_search(self) -> None:
+        for d in range(1, 257):
+            self.hasSearchedAtLeastOneMove = False
+            self.dynamic_alpha_beta_bounds[0, d] = self.NEGATIVE_INFINITY
+            self.dynamic_alpha_beta_bounds[1, d] = self.POSITIVE_INFINITY
+            
+            iter_start_nodes = self.searchDiagnostics.numPositionsEvaluated
+            iter_start_time = time.perf_counter()
+            
+            self._search(d, 0, self.NEGATIVE_INFINITY, self.POSITIVE_INFINITY)
+            
+            iter_duration = time.perf_counter() - iter_start_time
+            iter_nodes = self.searchDiagnostics.numPositionsEvaluated - iter_start_nodes
+            
+            if not self.searchCancelled:
+                self.searchDiagnostics.iteration_telemetry_logs.append({
+                    "target_depth": d,
+                    "completed": True,
+                    "nodes_evaluated": iter_nodes,
+                    "duration_seconds": iter_duration,
+                    "iteration_nps": iter_nodes / (iter_duration + 1e-9),
+                    "current_best_eval": self.bestEvalThisIteration
+                })
+            
+            if self.timeManager.check_time_limits() or self.searchCancelled:
+                if self.hasSearchedAtLeastOneMove:
+                    self.bestMove, self.bestEval = self.bestMoveThisIteration, self.bestEvalThisIteration
+                break
+            else:
+                self.CurrentDepth, self.bestMove, self.bestEval = d, self.bestMoveThisIteration, self.bestEvalThisIteration
+                self.bestEvalThisIteration = -self.POSITIVE_INFINITY
+                self.bestMoveThisIteration = None
+                if abs(self.bestEval) > self.IMMEDIATE_MATE_SCORE - 1000 and (self.IMMEDIATE_MATE_SCORE - abs(self.bestEval)) <= d:
+                    break
+
+    def _search(self, ply_rem: int, ply_f_root: int, alpha: int, beta: int, num_ext: int = 0, prev_m: Optional[Move] = None, p_was_cap: bool = False) -> int:
+        if self.timeManager.check_time_limits():
+            self.searchCancelled = True
+            return 0
+        if self.searchCancelled: return 0
+        if ply_f_root > 0:
+            if self.board.current_game_state.halfmove_clock >= 100 or self.repetitionTable.contains(self.board.zobrist_key): return 0
+            alpha, beta = max(alpha, -self.IMMEDIATE_MATE_SCORE + ply_f_root), min(beta, self.IMMEDIATE_MATE_SCORE - ply_f_root)
+            if alpha >= beta: return alpha
+
+        self.transpositionTable.board_zobrist_key_placeholder = self.board.zobrist_key
+        tt_val = self.transpositionTable.lookup_evaluation(ply_rem, ply_f_root, alpha, beta)
+        if tt_val != TranspositionTable.LOOKUP_FAILED:
+            if ply_f_root == 0:
+                self.bestMoveThisIteration = self.transpositionTable.try_get_stored_move()
+                self.bestEvalThisIteration = self.transpositionTable.table[self.transpositionTable.current_index].value
+            return tt_val
+
+        if ply_rem == 0: return self._quiescence_search(alpha, beta)
+        moves = self.moveGenerator.generate_moves(self.board, captures_only=False)
+        p_best = self.bestMove if ply_f_root == 0 else self.transpositionTable.try_get_stored_move()
+        p_best_v = (p_best.start_square | (p_best.target_square << 6) | (p_best.move_flag << 12)) if p_best else None
+        
+        self.moveOrderer.order_moves(p_best_v, self.board, moves, int(self.moveGenerator.opponentAttackMap), int(self.moveGenerator.opponentPawnAttackMap), False, ply_f_root)
+        if len(moves) == 0: return -(self.IMMEDIATE_MATE_SCORE - ply_f_root) if self.moveGenerator.inCheck else 0
+        if ply_f_root > 0 and prev_m is not None:
+            self.repetitionTable.push(self.board.zobrist_key, p_was_cap or (self.board.square[prev_m.target_square] & 7) == 1)
+
+        bound, b_move = TranspositionTable.UPPER_BOUND, None
+        for i, m in enumerate(moves):
+            is_cap = (self.board.square[m.target_square] & 7) != 0
+            state_hist = self.board.make_move(m)
+            ext = 1 if num_ext < self.MAX_EXTENSIONS and (self.moveGenerator.inCheck or ((self.board.square[m.target_square] & 7) == 1 and m.target_square >> 3 in [1, 6])) else 0
+            
+            n_full = True
+            if ext == 0 and ply_rem >= 3 and i >= 3 and not is_cap:
+                ev_score = -self._search(ply_rem - 2, ply_f_root + 1, -alpha - 1, -alpha, num_ext, m, is_cap)
+                n_full = ev_score > alpha
+            if n_full:
+                ev_score = -self._search(ply_rem - 1 + ext, ply_f_root + 1, -beta, -alpha, num_ext + ext, m, is_cap)
+            
+            self.board.unmake_move(m, state_hist)
+            if self.searchCancelled: return 0
+            
+            if ev_score >= beta:
+                self.transpositionTable.board_zobrist_key_placeholder = self.board.zobrist_key
+                self.transpositionTable.store_evaluation(ply_rem, ply_f_root, beta, TranspositionTable.LOWER_BOUND, m)
+                if i == 0 and ply_rem < 100: self.searchDiagnostics.fail_high_first_matrix[0, ply_rem] += 1
+                if ply_rem < 100: self.searchDiagnostics.fail_high_first_matrix[1, ply_rem] += 1
+                if not is_cap:
+                    if ply_f_root < self.moveOrderer.MAX_KILLER_MOVE_PLY:
+                        self.moveOrderer.killer_moves[ply_f_root].add((m.start_square | (m.target_square << 6) | (m.move_flag << 12)))
+                    self.moveOrderer.history[self.board.move_colour_index, m.start_square, m.target_square] += ply_rem * ply_rem
+                if ply_f_root > 0: self.repetitionTable.try_pop()
+                self.searchDiagnostics.numCutOffs += 1
+                return beta
+            if ev_score > alpha:
+                bound, b_move, alpha = TranspositionTable.EXACT, m, ev_score
+                if ply_f_root == 0:
+                    self.bestMoveThisIteration, self.bestEvalThisIteration, self.hasSearchedAtLeastOneMove = m, ev_score, True
+                    self.root_moves_scores[m.start_square | (m.target_square << 6)] = ev_score
+
+        if ply_f_root > 0: self.repetitionTable.try_pop()
+        self.transpositionTable.board_zobrist_key_placeholder = self.board.zobrist_key
+        self.transpositionTable.store_evaluation(ply_rem, ply_f_root, alpha, bound, b_move)
+        return alpha
+
+    def _quiescence_search(self, alpha: int, beta: int) -> int:
+        if self.searchCancelled: return 0
+        ev_score = self.evaluation.evaluate(self.board)
+        self.searchDiagnostics.numPositionsEvaluated += 1
+        if ev_score >= beta: return beta
+        if ev_score > alpha: alpha = ev_score
+        
+        moves = self.moveGenerator.generate_moves(self.board, captures_only=True)
+        self.moveOrderer.order_moves(None, self.board, moves, int(self.moveGenerator.opponentAttackMap), int(self.moveGenerator.opponentPawnAttackMap), True, 0)
+        for m in moves:
+            s_hist = self.board.make_move(m)
+            ev_score = -self._quiescence_search(-beta, -alpha)
+            self.board.unmake_move(m, s_hist)
+            if ev_score >= beta: return beta
+            if ev_score > alpha: alpha = ev_score
+        return alpha
+
+    def compute_branching_factor_metrics(self) -> Tuple[float, float]:
+        hist = self.searchDiagnostics.branching_history_vector[:self.searchDiagnostics.numCompletedIterations]
+        if len(hist) == 0: return 0.0, 0.0
+        return float(np.mean(hist)), float(np.var(hist))
+
+    def evaluate_variance_via_mock_pca(self) -> float:
+        scores = np.array(list(self.root_moves_scores.values()), dtype=np.float64)
+        if len(scores) <= 1: return 0.0
+        centered = scores - np.mean(scores)
+        return float(np.dot(centered, centered) / (len(scores) - 1))
+
+    def get_fail_high_first_ratio(self) -> float:
+        f_first = np.sum(self.searchDiagnostics.fail_high_first_matrix[0])
+        f_total = np.sum(self.searchDiagnostics.fail_high_first_matrix[1])
+        return float(f_first / f_total) if f_total > 0 else 0.0
+
+    def compute_iterative_depth_regression(self) -> Tuple[float, float]:
+        y = self.searchDiagnostics.branching_history_vector[:self.CurrentDepth]
+        x = np.arange(len(y))
+        if len(y) <= 1: return 0.0, 0.0
+        A = np.vstack([x, np.ones(len(x))]).T
+        m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        return float(m), float(c)
+
+    def force_asymmetric_aspiration_window(self, prev_score: int, depth: int) -> Tuple[int, int]:
+        delta = 15 if depth < 6 else 30
+        return prev_score - delta, prev_score + delta
+
+    def set_transposition_table_size(self, size_mb: int) -> None:
+        self.transpositionTable = TranspositionTable(size_mb)
+
+    def prune_history_heuristics(self) -> None:
+        self.moveOrderer.history = (self.moveOrderer.history // 2).astype(np.int32)
+
+    def simulate_multithreaded_search_bounds(self, branches: int) -> np.ndarray:
+        return np.linspace(self.NEGATIVE_INFINITY, self.POSITIVE_INFINITY, branches)
+
+    def query_root_move_score(self, m: Move) -> int:
+        return self.root_moves_scores.get(m.start_square | (m.target_square << 6), self.NEGATIVE_INFINITY)
+
+    def update_root_telemetry_metrics(self, duration: float) -> None:
+        if duration > 0:
+            self.searchDiagnostics.nodes_per_second = self.searchDiagnostics.numPositionsEvaluated / duration
+        self.searchDiagnostics.sel_depth = self.CurrentDepth + 2
