@@ -1,0 +1,915 @@
+chess_ai_workspace/
+│
+├── precomputed_move_data.py  # Geometric lookup tables, rays, and spatial tracking
+├── board_state.py            # Bitfield layer structures and Zobrist tables
+├── move_generator.py         # Advanced legal move filtering & tactical check maps
+├── engine_evaluation.py      # Statistical evaluation matrices & Tapered Phase scores
+└── engine_search.py          # Minimax with Alpha-Beta pruning & Data Science export pipelines
+
+
+
+import numpy as np
+from typing import List
+
+class Coord:
+    """Zero-allocation 2D chess coordinate conversion container."""
+    __slots__ = ['file_index', 'rank_index']
+    def __init__(self, file_index: int, rank_index: int):
+        self.file_index = file_index
+        self.rank_index = rank_index
+        
+    def is_valid_square(self) -> bool:
+        return 0 <= self.file_index < 8 and 0 <= self.rank_index < 8
+        
+    def __add__(self, other: 'Coord') -> 'Coord':
+        return Coord(self.file_index + other.file_index, self.rank_index + other.rank_index)
+        
+    def __sub__(self, other: 'Coord') -> 'Coord':
+        return Coord(self.file_index - other.file_index, self.rank_index - other.rank_index)
+        
+    def __mul__(self, scalar: int) -> 'Coord':
+        return Coord(self.file_index * scalar, self.rank_index * scalar)
+
+
+class PrecomputedMoveData:
+    """
+    Exhaustive geometric mapping matrices compiling line intersection masks,
+    direction vectors, Chebyshev/Manhattan metrics, and ray bitfields.
+    """
+    alignMask = np.zeros((64, 64), dtype=np.uint64)
+    dirRayMask = np.zeros((8, 64), dtype=np.uint64)
+    
+    directionOffsets: List[int] = [8, -8, -1, 1, 7, -7, 9, -9]
+    dirOffsets2D: List[Coord] = [
+        Coord(0, 1),   Coord(0, -1),  Coord(-1, 0),  Coord(1, 0),
+        Coord(-1, 1),  Coord(1, -1),  Coord(1, 1),   Coord(-1, -1)
+    ]
+    
+    numSquaresToEdge: List[List[int]] = [[0] * 8 for _ in range(64)]
+    knightMoves: List[np.ndarray] = [None] * 64
+    kingMoves: List[np.ndarray] = [None] * 64
+    
+    pawnAttackDirections: List[List[int]] = [[4, 6], [7, 5]]
+    
+    pawnAttacksWhite: List[np.ndarray] = [None] * 64
+    pawnAttacksBlack: List[np.ndarray] = [None] * 64
+    directionLookup: np.ndarray = np.zeros(127, dtype=np.int32)
+    
+    kingAttackBitboards: np.ndarray = np.zeros(64, dtype=np.uint64)
+    knightAttackBitboards: np.ndarray = np.zeros(64, dtype=np.uint64)
+    pawnAttackBitboards: np.zeros((64, 2), dtype=np.uint64)
+    
+    rookMoves: np.ndarray = np.zeros(64, dtype=np.uint64)
+    bishopMoves: np.ndarray = np.zeros(64, dtype=np.uint64)
+    queenMoves: np.ndarray = np.zeros(64, dtype=np.uint64)
+    
+    OrthogonalDistance = np.zeros((64, 64), dtype=np.int32)
+    kingDistance = np.zeros((64, 64), dtype=np.int32)
+    CentreManhattanDistance = np.zeros(64, dtype=np.int32)
+
+    @classmethod
+    def initialize_static_data(cls):
+        all_knight_jumps = [15, 17, -17, -15, 10, -6, 6, -10]
+        
+        for sq in range(64):
+            y = sq // 8
+            x = sq % 8
+            
+            north, south, west, east = 7 - y, y, x, 7 - x
+            cls.numSquaresToEdge[sq] = [
+                north, south, west, east,
+                min(north, west), min(south, east), min(north, east), min(south, west)
+            ]
+            
+            # Knight vector jumps
+            legal_knight_jumps = []
+            knight_bitboard = 0
+            for delta in all_knight_jumps:
+                target_sq = sq + delta
+                if 0 <= target_sq < 64:
+                    ty, tx = target_sq // 8, target_sq % 8
+                    if max(abs(x - tx), abs(y - ty)) == 2:
+                        legal_knight_jumps.append(target_sq)
+                        knight_bitboard |= (1 << target_sq)
+            cls.knightMoves[sq] = np.array(legal_knight_jumps, dtype=np.uint8)
+            cls.knightAttackBitboards[sq] = knight_bitboard
+            
+            # King move sets
+            legal_king_moves = []
+            for delta in cls.directionOffsets:
+                target_sq = sq + delta
+                if 0 <= target_sq < 64:
+                    ty, tx = target_sq // 8, target_sq % 8
+                    if max(abs(x - tx), abs(y - ty)) == 1:
+                        legal_king_moves.append(target_sq)
+                        cls.kingAttackBitboards[sq] |= (1 << target_sq)
+            cls.kingMoves[sq] = np.array(legal_king_moves, dtype=np.uint8)
+            
+            # Pawn spatial capture arrays
+            pawn_captures_white, pawn_captures_black = [], []
+            if x > 0:
+                if y < 7:
+                    pawn_captures_white.append(sq + 7)
+                    cls.pawnAttackBitboards[sq, 0] |= (1 << (sq + 7))
+                if y > 0:
+                    pawn_captures_black.append(sq - 9)
+                    cls.pawnAttackBitboards[sq, 1] |= (1 << (sq - 9))
+            if x < 7:
+                if y < 7:
+                    pawn_captures_white.append(sq + 9)
+                    cls.pawnAttackBitboards[sq, 0] |= (1 << (sq + 9))
+                if y > 0:
+                    pawn_captures_black.append(sq - 7)
+                    cls.pawnAttackBitboards[sq, 1] |= (1 << (sq - 7))
+            cls.pawnAttacksWhite[sq] = np.array(pawn_captures_white, dtype=np.int32)
+            cls.pawnAttacksBlack[sq] = np.array(pawn_captures_black, dtype=np.int32)
+            
+            # Raw sliding paths cache
+            for d in range(4):
+                offset = cls.directionOffsets[d]
+                for n in range(cls.numSquaresToEdge[sq][d]):
+                    cls.rookMoves[sq] |= (1 << (sq + offset * (n + 1)))
+            for d in range(4, 8):
+                offset = cls.directionOffsets[d]
+                for n in range(cls.numSquaresToEdge[sq][d]):
+                    cls.bishopMoves[sq] |= (1 << (sq + offset * (n + 1)))
+            cls.queenMoves[sq] = cls.rookMoves[sq] | cls.bishopMoves[sq]
+
+        for i in range(127):
+            offset = i - 63
+            abs_offset = abs(offset)
+            abs_dir = 1
+            if abs_offset % 9 == 0: abs_dir = 9
+            elif abs_offset % 8 == 0: abs_dir = 8
+            elif abs_offset % 7 == 0: abs_dir = 7
+            cls.directionLookup[i] = abs_dir * (1 if offset > 0 else (-1 if offset < 0 else 0))
+
+        # Core distance metric matrix fills
+        for sq_a in range(64):
+            file_index_a, rank_index_a = sq_a & 7, sq_a >> 3
+            file_dst = max(3 - file_index_a, file_index_a - 4)
+            rank_dst = max(3 - rank_index_a, rank_index_a - 4)
+            cls.CentreManhattanDistance[sq_a] = file_dst + rank_dst
+            
+            for sq_b in range(64):
+                file_index_b, rank_index_b = sq_b & 7, sq_b >> 3
+                r_dist = abs(rank_index_a - rank_index_b)
+                f_dist = abs(file_index_a - file_index_b)
+                cls.OrthogonalDistance[sq_a, sq_b] = f_dist + r_dist
+                cls.kingDistance[sq_a, sq_b] = max(f_dist, r_dist)
+
+        for sq_a in range(64):
+            for sq_b in range(64):
+                file_index_a, rank_index_a = sq_a & 7, sq_a >> 3
+                file_index_b, rank_index_b = sq_b & 7, sq_b >> 3
+                df, dr = file_index_b - file_index_a, rank_index_b - rank_index_a
+                sf = 1 if df > 0 else (-1 if df < 0 else 0)
+                sr = 1 if dr > 0 else (-1 if dr < 0 else 0)
+                dir_coord = Coord(sf, sr)
+                
+                for i in range(-8, 8):
+                    curr_coord = Coord(file_index_a, rank_index_a) + dir_coord * i
+                    if curr_coord.is_valid_square():
+                        cls.alignMask[sq_a, sq_b] |= (1 << ((curr_coord.rank_index * 8) + curr_coord.file_index))
+
+        for d_idx in range(len(cls.dirOffsets2D)):
+            for sq_idx in range(64):
+                start_coord = Coord(sq_idx & 7, sq_idx >> 3)
+                for i in range(8):
+                    curr_coord = start_coord + cls.dirOffsets2D[d_idx] * i
+                    if curr_coord.is_valid_square():
+                        cls.dirRayMask[d_idx, sq_idx] |= (1 << ((curr_coord.rank_index * 8) + curr_coord.file_index))
+                    else:
+                        break
+
+PrecomputedMoveData.initialize_static_data()
+
+
+
+
+import numpy as np
+
+class GameState:
+    """Stores board structural settings, castling state values, and game flags."""
+    def __init__(self, castling_rights: int = 0xF, ep_file: int = 0, halfmove: int = 0):
+        self.castling_rights = castling_rights
+        self.en_passant_file = ep_file
+        self.halfmove_clock = halfmove
+
+    def has_kingside_castle_right(self, is_white: bool) -> bool:
+        mask = 0b0001 if is_white else 0b0100
+        return (self.castling_rights & mask) != 0
+
+    def has_queenside_castle_right(self, is_white: bool) -> bool:
+        mask = 0b0010 if is_white else 0b1000
+        return (self.castling_rights & mask) != 0
+
+
+class Board:
+    """
+    Manages active layer storage arrays, color boundaries,
+    and piece layout bitmasks.
+    """
+    def __init__(self):
+        self.square = np.zeros(64, dtype=np.uint8)
+        self.move_colour = 0  # 0: White, 8: Black
+        self.opponent_colour = 8
+        self.move_colour_index = 0  # 0: White, 1: Black
+        
+        self.colour_bitboards = np.zeros(2, dtype=np.uint64)
+        self.piece_bitboards = np.zeros(15, dtype=np.uint64)
+        self.all_pieces_bitboard = np.uint64(0)
+        
+        self.friendly_orthogonal_sliders = np.uint64(0)
+        self.friendly_diagonal_sliders = np.uint64(0)
+        self.enemy_orthogonal_sliders = np.uint64(0)
+        self.enemy_diagonal_sliders = np.uint64(0)
+        
+        self.king_square = np.zeros(2, dtype=np.int32)
+        self.queens = [[], []]
+        self.rooks = [[], []]
+        self.bishops = [[], []]
+        
+        self.current_game_state = GameState()
+        self.is_white_to_move = True
+        self.zobrist_key = np.uint64(0)
+        self._set_default_start_position()
+
+    def _set_default_start_position(self):
+        """Sets standard starting layouts into the square indexing arrays."""
+        # Setup standard pawns
+        for i in range(8, 16):  self.square[i] = 1 | 0  # White Pawn
+        for i in range(48, 56): self.square[i] = 1 | 8  # Black Pawn
+        
+        # Minor/Major pieces
+        back_row = [4, 2, 3, 5, 6, 3, 2, 4]
+        for idx, pt in enumerate(back_row):
+            self.square[idx] = pt | 0       # White Major
+            self.square[56 + idx] = pt | 8  # Black Major
+            
+        self.update_bitboards()
+
+    def update_bitboards(self):
+        """Re-compiles matrix entries down to efficient logical bit representations."""
+        self.colour_bitboards.fill(0)
+        self.piece_bitboards.fill(0)
+        self.all_pieces_bitboard = np.uint64(0)
+        
+        self.queens = [[], []]; self.rooks = [[], []]; self.bishops = [[], []]
+        
+        for sq in range(64):
+            piece = self.square[sq]
+            if piece == 0: continue
+            
+            c_idx = 1 if (piece & 8) else 0
+            p_type = piece & 7
+            
+            mask = np.uint64(1 << sq)
+            self.colour_bitboards[c_idx] |= mask
+            self.piece_bitboards[piece] |= mask
+            
+            if p_type == 6:   self.king_square[c_idx] = sq
+            elif p_type == 5: self.queens[c_idx].append(sq)
+            elif p_type == 4: self.rooks[c_idx].append(sq)
+            elif p_type == 3: self.bishops[c_idx].append(sq)
+            
+        self.all_pieces_bitboard = self.colour_bitboards[0] | self.colour_bitboards[1]
+        
+        f_idx, e_idx = self.move_colour_index, 1 - self.move_colour_index
+        white_queen = self.piece_bitboards[5 | 0]; black_queen = self.piece_bitboards[5 | 8]
+        white_rook = self.piece_bitboards[4 | 0];  black_rook = self.piece_bitboards[4 | 8]
+        white_bishop = self.piece_bitboards[3 | 0]; black_bishop = self.piece_bitboards[3 | 8]
+        
+        if f_idx == 0:
+            self.friendly_orthogonal_sliders = white_rook | white_queen
+            self.friendly_diagonal_sliders = white_bishop | white_queen
+            self.enemy_orthogonal_sliders = black_rook | black_queen
+            self.enemy_diagonal_sliders = black_bishop | black_queen
+        else:
+            self.friendly_orthogonal_sliders = black_rook | black_queen
+            self.friendly_diagonal_sliders = black_bishop | black_queen
+            self.enemy_orthogonal_sliders = white_rook | white_queen
+            self.enemy_diagonal_sliders = white_bishop | white_queen
+
+    def make_move(self, move) -> int:
+        """Applies a legal move and toggles the system's tracking bitboards."""
+        captured_piece = self.square[move.target_square]
+        moving_piece = self.square[move.start_square]
+        
+        self.square[move.target_square] = moving_piece
+        self.square[move.start_square] = 0
+        
+        # Explicit special handling for promotions
+        if move.move_flag >= 4:
+            promo_types = {4: 5, 5: 4, 6: 2, 7: 3}
+            self.square[move.target_square] = promo_types.get(move.move_flag, 5) | self.move_colour
+
+        # Save and switch color configurations
+        prev_state = (self.move_colour, self.move_colour_index, captured_piece)
+        self.move_colour = 8 if self.move_colour == 0 else 0
+        self.opponent_colour = 8 if self.move_colour == 0 else 0
+        self.move_colour_index = 1 - self.move_colour_index
+        self.is_white_to_move = (self.move_colour == 0)
+        
+        self.update_bitboards()
+        return prev_state
+
+    def unmake_move(self, move, state_history):
+        """Reverts the board layout and layout history parameters precisely."""
+        self.move_colour, self.move_colour_index, captured_piece = state_history
+        self.opponent_colour = 8 if self.move_colour == 0 else 0
+        self.is_white_to_move = (self.move_colour == 0)
+        
+        moving_piece = self.square[move.target_square]
+        if move.move_flag >= 4:
+            self.square[move.start_square] = 1 | self.move_colour
+        else:
+            self.square[move.start_square] = moving_piece
+            
+        self.square[move.target_square] = captured_piece
+        self.update_bitboards()
+
+
+
+
+
+
+
+import numpy as np
+from typing import List
+from precomputed_move_data import PrecomputedMoveData
+
+class Magic:
+    """Sliding attack calculator resolving intercept configurations along raw ray offsets."""
+    @staticmethod
+    def get_slider_attacks(square: int, blockers: int, ortho: bool) -> int:
+        mask = np.uint64(0)
+        offsets = PrecomputedMoveData.directionOffsets[0:4] if ortho else PrecomputedMoveData.directionOffsets[4:8]
+        limits = PrecomputedMoveData.numSquaresToEdge[square][0:4] if ortho else PrecomputedMoveData.numSquaresToEdge[square][4:8]
+        
+        for d in range(4):
+            offset = offsets[d]
+            for n in range(limits[d]):
+                target = square + offset * (n + 1)
+                mask |= np.uint64(1 << target)
+                if (blockers >> target) & 1:
+                    break
+        return int(mask)
+
+    @staticmethod
+    def get_rook_attacks(square: int, blockers: int) -> int:
+        return Magic.get_slider_attacks(square, blockers, True)
+
+    @staticmethod
+    def get_bishop_attacks(square: int, blockers: int) -> int:
+        return Magic.get_slider_attacks(square, blockers, False)
+
+
+class Move:
+    __slots__ = ['start_square', 'target_square', 'move_flag']
+    CastleFlag = 3
+    PawnTwoUpFlag = 1
+    EnPassantCaptureFlag = 2
+    PromoteToQueenFlag = 4
+    PromoteToKnightFlag = 6
+    PromoteToRookFlag = 5
+    PromoteToBishopFlag = 7
+    
+    def __init__(self, start: int, target: int, flag: int = 0):
+        self.start_square = start
+        self.target_square = target
+        self.move_flag = flag
+
+
+class MoveGenerator:
+    """Generates legal moves by identifying checks and pins using bitfield intersections."""
+    MaxMoves = 218
+
+    def __init__(self):
+        self.moves: List[Move] = [None] * self.MaxMoves
+        self.currMoveIndex = 0
+        self.isWhiteToMove = True
+        self.friendlyColour, self.opponentColour = 0, 0
+        self.friendlyKingSquare, self.friendlyIndex, self.enemyIndex = 0, 0, 0
+        self.inCheck, self.inDoubleCheck = False, False
+        
+        self.checkRayBitmask, self.pinRays, self.notPinRays = 0, 0, 0
+        self.opponentAttackMapNoPawns, self.opponentAttackMap = 0, 0
+        self.opponentPawnAttackMap, self.opponentSlidingAttackMap = 0, 0
+        self.generateQuietMoves = True
+        self.board = None
+        
+        self.enemyPieces, self.friendlyPieces, self.allPieces = 0, 0, 0
+        self.emptySquares, self.emptyOrEnemySquares, self.moveTypeMask = 0, 0, 0
+
+    def generate_moves(self, board, captures_only: bool = False) -> List[Move]:
+        self.board = board
+        self.generateQuietMoves = not captures_only
+        self._init()
+        self._generate_king_moves()
+
+        if not self.inDoubleCheck:
+            self._generate_sliding_moves()
+            self._generate_knight_moves()
+            self._generate_pawn_moves()
+
+        return self.moves[:self.currMoveIndex]
+
+    def _init(self):
+        self.currMoveIndex = 0
+        self.inCheck, self.inDoubleCheck = False, False
+        self.checkRayBitmask, self.pinRays = 0, 0
+
+        self.isWhiteToMove = self.board.move_colour == 0
+        self.friendlyColour = self.board.move_colour
+        self.opponentColour = self.board.opponent_colour
+        self.friendlyKingSquare = self.board.king_square[self.board.move_colour_index]
+        self.friendlyIndex = self.board.move_colour_index
+        self.enemyIndex = 1 - self.friendlyIndex
+
+        self.enemyPieces = int(self.board.colour_bitboards[self.enemyIndex])
+        self.friendlyPieces = int(self.board.colour_bitboards[self.friendlyIndex])
+        self.allPieces = int(self.board.all_pieces_bitboard)
+        self.emptySquares = (~self.allPieces) & 0xFFFFFFFFFFFFFFFF
+        self.emptyOrEnemySquares = self.emptySquares | self.enemyPieces
+        self.moveTypeMask = 0xFFFFFFFFFFFFFFFF if self.generateQuietMoves else self.enemyPieces
+
+        self._calculate_attack_data()
+        self.notPinRays = (~self.pinRays) & 0xFFFFFFFFFFFFFFFF
+
+    def _generate_king_moves(self):
+        legal_mask = (~(self.opponentAttackMap | self.friendlyPieces)) & 0xFFFFFFFFFFFFFFFF
+        king_moves = int(PrecomputedMoveData.kingAttackBitboards[self.friendlyKingSquare]) & legal_mask & self.moveTypeMask
+        while king_moves != 0:
+            target_square = (king_moves & -king_moves).bit_length() - 1
+            king_moves &= king_moves - 1
+            self.moves[self.currMoveIndex] = Move(self.friendlyKingSquare, target_square)
+            self.currMoveIndex += 1
+
+        if not self.inCheck and self.generateQuietMoves:
+            castle_blockers = self.opponentAttackMap | self.allPieces
+            if self.board.current_game_state.has_kingside_castle_right(self.isWhiteToMove):
+                castle_mask = 0x60 if self.isWhiteToMove else 0x6000000000000000
+                if (castle_mask & castle_blockers) == 0:
+                    self.moves[self.currMoveIndex] = Move(self.friendlyKingSquare, 6 if self.isWhiteToMove else 62, Move.CastleFlag)
+                    self.currMoveIndex += 1
+            if self.board.current_game_state.has_queenside_castle_right(self.isWhiteToMove):
+                castle_mask = 0x0C if self.isWhiteToMove else 0x0C00000000000000
+                castle_block_mask = 0x0E if self.isWhiteToMove else 0x0E00000000000000
+                if (castle_mask & castle_blockers) == 0 and (castle_block_mask & self.allPieces) == 0:
+                    self.moves[self.currMoveIndex] = Move(self.friendlyKingSquare, 2 if self.isWhiteToMove else 58, Move.CastleFlag)
+                    self.currMoveIndex += 1
+
+    def _generate_sliding_moves(self):
+        move_mask = self.emptyOrEnemySquares & self.checkRayBitmask & self.moveTypeMask
+        orthogonal_sliders = int(self.board.friendly_orthogonal_sliders)
+        diagonal_sliders = int(self.board.friendly_diagonal_sliders)
+
+        if self.inCheck:
+            orthogonal_sliders &= ~self.pinRays
+            diagonal_sliders &= ~self.pinRays
+
+        while orthogonal_sliders != 0:
+            start_square = (orthogonal_sliders & -orthogonal_sliders).bit_length() - 1
+            orthogonal_sliders &= orthogonal_sliders - 1
+            move_squares = Magic.get_rook_attacks(start_square, self.allPieces) & move_mask
+            if (self.pinRays >> start_square) & 1:
+                move_squares &= int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare])
+            while move_squares != 0:
+                target_square = (move_squares & -move_squares).bit_length() - 1
+                move_squares &= move_squares - 1
+                self.moves[self.currMoveIndex] = Move(start_square, target_square)
+                self.currMoveIndex += 1
+
+        while diagonal_sliders != 0:
+            start_square = (diagonal_sliders & -diagonal_sliders).bit_length() - 1
+            diagonal_sliders &= diagonal_sliders - 1
+            move_squares = Magic.get_bishop_attacks(start_square, self.allPieces) & move_mask
+            if (self.pinRays >> start_square) & 1:
+                move_squares &= int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare])
+            while move_squares != 0:
+                target_square = (move_squares & -move_squares).bit_length() - 1
+                move_squares &= move_squares - 1
+                self.moves[self.currMoveIndex] = Move(start_square, target_square)
+                self.currMoveIndex += 1
+
+    def _generate_knight_moves(self):
+        friendly_knight = 2 | self.friendlyColour
+        knights = int(self.board.piece_bitboards[friendly_knight]) & self.notPinRays
+        move_mask = self.emptyOrEnemySquares & self.checkRayBitmask & self.moveTypeMask
+        while knights != 0:
+            knight_square = (knights & -knights).bit_length() - 1
+            knights &= knights - 1
+            move_squares = int(PrecomputedMoveData.knightAttackBitboards[knight_square]) & move_mask
+            while move_squares != 0:
+                target_square = (move_squares & -move_squares).bit_length() - 1
+                move_squares &= move_squares - 1
+                self.moves[self.currMoveIndex] = Move(knight_square, target_square)
+                self.currMoveIndex += 1
+
+    def _generate_pawn_moves(self):
+        push_dir = 1 if self.isWhiteToMove else -1
+        push_offset = push_dir * 8
+        friendly_pawn = 1 | self.friendlyColour
+        pawns = int(self.board.piece_bitboards[friendly_pawn])
+
+        promotion_rank_mask = 0xFF00000000000000 if self.isWhiteToMove else 0x00000000000000FF
+        
+        if self.isWhiteToMove:
+            single_push = (pawns << 8) & self.emptySquares
+            capture_a = (pawns << 7) & 0x7F7F7F7F7F7F7F7F & self.enemyPieces
+            capture_b = (pawns << 9) & 0xFEFEFEFEFEFEFEFE & self.enemyPieces
+        else:
+            single_push = (pawns >> 8) & self.emptySquares
+            capture_a = (pawns >> 9) & 0x7F7F7F7F7F7F7F7F & self.enemyPieces
+            capture_b = (pawns >> 7) & 0xFEFEFEFEFEFEFEFE & self.enemyPieces
+
+        push_promotions = single_push & promotion_rank_mask & self.checkRayBitmask
+        single_push_no_promotions = single_push & (~promotion_rank_mask) & self.checkRayBitmask
+        capture_promotions_a = capture_a & promotion_rank_mask & self.checkRayBitmask
+        capture_promotions_b = capture_b & promotion_rank_mask & self.checkRayBitmask
+
+        capture_a &= (self.checkRayBitmask & ~promotion_rank_mask)
+        capture_b &= (self.checkRayBitmask & ~promotion_rank_mask)
+
+        if self.generateQuietMoves:
+            while single_push_no_promotions != 0:
+                target_square = (single_push_no_promotions & -single_push_no_promotions).bit_length() - 1
+                single_push_no_promotions &= single_push_no_promotions - 1
+                start_square = target_square - push_offset
+                if ((self.pinRays >> start_square) & 1) == 0 or int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare]) == int(PrecomputedMoveData.alignMask[start_square, target_square]):
+                    self.moves[self.currMoveIndex] = Move(start_square, target_square)
+                    self.currMoveIndex += 1
+
+            double_push_rank = 0x00000000FF000000 if self.isWhiteToMove else 0x000000FF00000000
+            double_push = ((single_push << 8) if self.isWhiteToMove else (single_push >> 8)) & self.emptySquares & double_push_rank & self.checkRayBitmask
+            while double_push != 0:
+                target_square = (double_push & -double_push).bit_length() - 1
+                double_push &= double_push - 1
+                start_square = target_square - push_offset * 2
+                if ((self.pinRays >> start_square) & 1) == 0 or int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare]) == int(PrecomputedMoveData.alignMask[start_square, target_square]):
+                    self.moves[self.currMoveIndex] = Move(start_square, target_square, Move.PawnTwoUpFlag)
+                    self.currMoveIndex += 1
+
+        while capture_a != 0:
+            target_square = (capture_a & -capture_a).bit_length() - 1
+            capture_a &= capture_a - 1
+            start_square = target_square - 7 if self.isWhiteToMove else target_square + 9
+            if ((self.pinRays >> start_square) & 1) == 0 or int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare]) == int(PrecomputedMoveData.alignMask[start_square, target_square]):
+                self.moves[self.currMoveIndex] = Move(start_square, target_square)
+                self.currMoveIndex += 1
+
+        while capture_b != 0:
+            target_square = (capture_b & -capture_b).bit_length() - 1
+            capture_b &= capture_b - 1
+            start_square = target_square - 9 if self.isWhiteToMove else target_square + 7
+            if ((self.pinRays >> start_square) & 1) == 0 or int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare]) == int(PrecomputedMoveData.alignMask[start_square, target_square]):
+                self.moves[self.currMoveIndex] = Move(start_square, target_square)
+                self.currMoveIndex += 1
+
+        while push_promotions != 0:
+            target_square = (push_promotions & -push_promotions).bit_length() - 1
+            push_promotions &= push_promotions - 1
+            self._generate_promotions(target_square - push_offset, target_square)
+
+        while capture_promotions_a != 0:
+            target_square = (capture_promotions_a & -capture_promotions_a).bit_length() - 1
+            capture_promotions_a &= capture_promotions_a - 1
+            self._generate_promotions(target_square - 7 if self.isWhiteToMove else target_square + 9, target_square)
+
+        while capture_promotions_b != 0:
+            target_square = (capture_promotions_b & -capture_promotions_b).bit_length() - 1
+            capture_promotions_b &= capture_promotions_b - 1
+            self._generate_promotions(target_square - 9 if self.isWhiteToMove else target_square + 7, target_square)
+
+        if self.board.current_game_state.en_passant_file > 0:
+            ep_file = self.board.current_game_state.en_passant_file - 1
+            target_square = (5 if self.isWhiteToMove else 2) * 8 + ep_file
+            captured_pawn_square = target_square - push_offset
+
+            if ((self.checkRayBitmask >> captured_pawn_square) & 1):
+                if self.isWhiteToMove:
+                    attacks = (((1 << target_square) >> 7) & 0x7F7F7F7F7F7F7F7F) | (((1 << target_square) >> 9) & 0xFEFEFEFEFEFEFEFE)
+                else:
+                    attacks = (((1 << target_square) << 9) & 0x7F7F7F7F7F7F7F7F) | (((1 << target_square) << 7) & 0xFEFEFEFEFEFEFEFE)
+                
+                pawns_can_capture = pawns & attacks
+                while pawns_can_capture != 0:
+                    start_square = (pawns_can_capture & -pawns_can_capture).bit_length() - 1
+                    pawns_can_capture &= pawns_can_capture - 1
+                    if ((self.pinRays >> start_square) & 1) == 0 or int(PrecomputedMoveData.alignMask[start_square, self.friendlyKingSquare]) == int(PrecomputedMoveData.alignMask[start_square, target_square]):
+                        if not self._in_check_after_en_passant(start_square, target_square, captured_pawn_square):
+                            self.moves[self.currMoveIndex] = Move(start_square, target_square, Move.EnPassantCaptureFlag)
+                            self.currMoveIndex += 1
+
+    def _generate_promotions(self, start_square: int, target_square: int):
+        self.moves[self.currMoveIndex] = Move(start_square, target_square, Move.PromoteToQueenFlag)
+        self.currMoveIndex += 1
+        if self.generateQuietMoves:
+            self.moves[self.currMoveIndex] = Move(start_square, target_square, Move.PromoteToKnightFlag)
+            self.moves[self.currMoveIndex + 1] = Move(start_square, target_square, Move.PromoteToRookFlag)
+            self.moves[self.currMoveIndex + 2] = Move(start_square, target_square, Move.PromoteToBishopFlag)
+            self.currMoveIndex += 3
+
+    def _in_check_after_en_passant(self, start_square: int, target_square: int, ep_capture_square: int) -> bool:
+        enemy_ortho = int(self.board.enemy_orthogonal_sliders)
+        if enemy_ortho != 0:
+            masked_blockers = (self.allPieces ^ ((1 << ep_capture_square) | (1 << start_square) | (1 << target_square))) & 0xFFFFFFFFFFFFFFFF
+            rook_attacks = Magic.get_rook_attacks(self.friendlyKingSquare, masked_blockers)
+            return (rook_attacks & enemy_ortho) != 0
+        return False
+
+    def _gen_sliding_attack_map(self):
+        self.opponentSlidingAttackMap = 0
+        blockers = self.allPieces & (~(1 << self.friendlyKingSquare))
+        
+        ortho_pieces = int(self.board.enemy_orthogonal_sliders)
+        while ortho_pieces != 0:
+            start_square = (ortho_pieces & -ortho_pieces).bit_length() - 1
+            ortho_pieces &= ortho_pieces - 1
+            self.opponentSlidingAttackMap |= Magic.get_rook_attacks(start_square, blockers)
+            
+        diag_pieces = int(self.board.enemy_diagonal_sliders)
+        while diag_pieces != 0:
+            start_square = (diag_pieces & -diag_pieces).bit_length() - 1
+            diag_pieces &= diag_pieces - 1
+            self.opponentSlidingAttackMap |= Magic.get_bishop_attacks(start_square, blockers)
+
+    def _calculate_attack_data(self):
+        self._gen_sliding_attack_map()
+        
+        for d in range(8):
+            is_diagonal = d > 3
+            sliders = int(self.board.enemy_diagonal_sliders if is_diagonal else self.board.enemy_orthogonal_sliders)
+            if (int(PrecomputedMoveData.dirRayMask[d, self.friendlyKingSquare]) & sliders) == 0:
+                continue
+
+            n = PrecomputedMoveData.numSquaresToEdge[self.friendlyKingSquare][d]
+            offset = PrecomputedMoveData.directionOffsets[d]
+            is_friendly_along_ray = False
+            ray_mask = 0
+
+            for i in range(n):
+                square_index = self.friendlyKingSquare + offset * (i + 1)
+                ray_mask |= (1 << square_index)
+                piece = self.board.square[square_index]
+
+                if piece != 0:
+                    if (piece & 8) == self.friendlyColour:
+                        if not is_friendly_along_ray: is_friendly_along_ray = True
+                        else: break
+                    else:
+                        piece_type = piece & 7
+                        if (is_diagonal and piece_type in (3, 5)) or (not is_diagonal and piece_type in (4, 5)):
+                            if is_friendly_along_ray: self.pinRays |= ray_mask
+                            else:
+                                self.checkRayBitmask |= ray_mask
+                                self.inDoubleCheck = self.inCheck
+                                self.inCheck = True
+                            break
+                        else: break
+            if self.inDoubleCheck:
+                break
+
+        opponent_knight_attacks = 0
+        knights = int(self.board.piece_bitboards[2 | self.opponentColour])
+        friendly_king_board = (1 << self.friendlyKingSquare)
+
+        while knights != 0:
+            knight_square = (knights & -knights).bit_length() - 1
+            knights &= knights - 1
+            knight_attacks = int(PrecomputedMoveData.knightAttackBitboards[knight_square])
+            opponent_knight_attacks |= knight_attacks
+
+            if (knight_attacks & friendly_king_board) != 0:
+                self.inDoubleCheck = self.inCheck
+                self.inCheck = True
+                self.checkRayBitmask |= (1 << knight_square)
+
+        opponent_pawns_board = int(self.board.piece_bitboards[1 | self.opponentColour])
+        if self.isWhiteToMove:
+            self.opponentPawnAttackMap = (((opponent_pawns_board >> 9) & 0x7F7F7F7F7F7F7F7F) | ((opponent_pawns_board >> 7) & 0xFEFEFEFEFEFEFEFE)) & 0xFFFFFFFFFFFFFFFF
+        else:
+            self.opponentPawnAttackMap = (((opponent_pawns_board << 7) & 0x7F7F7F7F7F7F7F7F) | ((opponent_pawns_board << 9) & 0xFEFEFEFEFEFEFEFE)) & 0xFFFFFFFFFFFFFFFF
+            
+        if (self.opponentPawnAttackMap >> self.friendlyKingSquare) & 1:
+            self.inDoubleCheck = self.inCheck
+            self.inCheck = True
+            possible_origins = int(PrecomputedMoveData.pawnAttackBitboards[self.friendlyKingSquare, self.friendlyIndex])
+            self.checkRayBitmask |= (opponent_pawns_board & possible_origins)
+
+        enemy_king_square = self.board.king_square[self.enemyIndex]
+        self.opponentAttackMapNoPawns = self.opponentSlidingAttackMap | opponent_knight_attacks | int(PrecomputedMoveData.kingAttackBitboards[enemy_king_square])
+        self.opponentAttackMap = self.opponentAttackMapNoPawns | self.opponentPawnAttackMap
+
+        if not self.inCheck:
+            self.checkRayBitmask = 0xFFFFFFFFFFFFFFFF
+
+
+
+
+
+import numpy as np
+from board_state import Board
+
+class Evaluation:
+    """
+    Implements a Tapered Evaluation architecture, dynamically blending 
+    Middlegame (MG) and Endgame (EG) piece-square matrices via non-linear 
+    game phase interpolation metrics.
+    """
+    
+    # Standard piece valuations [Pawn, Knight, Bishop, Rook, Queen, King]
+    MG_Values = [100, 320, 330, 500, 900, 20000]
+    EG_Values = [130, 310, 320, 490, 880, 20000]
+    
+    # Piece Square Tables mapped to standard engine matrices
+    PST_Pawn_MG = [
+          0,   0,   0,   0,   0,   0,   0,   0,
+         50,  50,  50,  50,  50,  50,  50,  50,
+         10,  10,  20,  30,  30,  20,  10,  10,
+          5,   5,  10,  25,  25,  10,   5,   5,
+          0,   0,   0,  20,  20,   0,   0,   0,
+          5,  -5, -10,   0,   0, -10,  -5,   5,
+          5,  10,  10, -20, -20,  10,  10,   5,
+          0,   0,   0,   0,   0,   0,   0,   0
+    ]
+    
+    PST_Knight_MG = [
+        -50, -40, -30, -30, -30, -30, -40, -50,
+        -40, -20,   0,   0,   0,   0, -20, -40,
+        -30,   0,  10,  15,  15,  10,   0, -30,
+        -30,   5,  15,  20,  20,  15,   5, -30,
+        -30,   0,  15,  20,  20,  15,   0, -30,
+        -30,   5,  10,  15,  15,  10,   5, -30,
+        -40, -20,   0,   5,   5,   0, -20, -40,
+        -50, -40, -30, -30, -30, -30, -40, -50
+    ]
+
+    PST_King_MG = [
+        -30, -40, -40, -50, -50, -40, -40, -30,
+        -30, -40, -40, -50, -50, -40, -40, -30,
+        -30, -40, -40, -50, -50, -40, -40, -30,
+        -30, -40, -40, -50, -50, -40, -40, -30,
+        -20, -30, -30, -40, -40, -30, -30, -20,
+        -10, -20, -20, -20, -20, -20, -20, -10,
+         20,  20,   0,   0,   0,   0,  20,  20,
+         20,  30,  10,   0,   0,  10,  30,  20
+    ]
+    
+    PST_King_EG = [
+        -50, -40, -30, -20, -20, -30, -40, -50,
+        -30, -20, -10,   0,   0, -10, -20, -30,
+        -30, -10,  20,  30,  30,  20, -10, -30,
+        -30, -10,  30,  40,  40,  30, -10, -30,
+        -30, -10,  30,  40,  40,  30, -10, -30,
+        -30, -10,  20,  30,  30,  20, -10, -30,
+        -30, -30,   0,   0,   0,   0, -30, -30,
+        -50, -30, -30, -30, -30, -30, -30, -50
+    ]
+
+    @classmethod
+    def evaluate(cls, board: Board) -> int:
+        """Evaluates the position and returns a scalar score from White's perspective."""
+        mg_score = [0, 0]
+        eg_score = [0, 0]
+        game_phase_total = 0
+        
+        for sq in range(64):
+            piece = board.square[sq]
+            if piece == 0: continue
+            
+            c_idx = 1 if (piece & 8) else 0
+            p_type = (piece & 7) - 1
+            
+            # Tapered phase weights mapping
+            if p_type == 1 or p_type == 2:   game_phase_total += 1 # N / B
+            elif p_type == 3:                 game_phase_total += 2 # R
+            elif p_type == 4:                 game_phase_total += 4 # Q
+            
+            # Standard structural values accumulation
+            mg_score[c_idx] += cls.MG_Values[p_type]
+            eg_score[c_idx] += cls.EG_Values[p_type]
+            
+            # Coordinate mirror conversion for black piece matrices
+            p_sq = sq ^ 56 if c_idx == 0 else sq
+            
+            if p_type == 0: # Pawn
+                mg_score[c_idx] += cls.PST_Pawn_MG[p_sq]
+                eg_score[c_idx] += cls.PST_Pawn_MG[p_sq]
+            elif p_type == 1: # Knight
+                mg_score[c_idx] += cls.PST_Knight_MG[p_sq]
+                eg_score[c_idx] += cls.PST_Knight_MG[p_sq]
+            elif p_type == 5: # King
+                mg_score[c_idx] += cls.PST_King_MG[p_sq]
+                eg_score[c_idx] += cls.PST_King_EG[p_sq]
+
+        # Calculate exact fractional weight scaling
+        mg_weight = min(24, game_phase_total)
+        eg_weight = 24 - mg_weight
+        
+        white_eval = (mg_score[0] * mg_weight + eg_score[0] * eg_weight) // 24
+        black_eval = (mg_score[1] * mg_weight + eg_score[1] * eg_weight) // 24
+        
+        perspective = 1 if board.move_colour == 0 else -1
+        return (white_eval - black_eval) * perspective
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Any
+from board_state import Board
+from move_generator import MoveGenerator
+from engine_evaluation import Evaluation
+
+class Search:
+    """Runs a depth-bounded Alpha-Beta search and records position telemetry data."""
+    def __init__(self):
+        self.generator = MoveGenerator()
+        self.telemetry_records: List[Dict[str, Any]] = []
+
+    def run_search(self, board: Board, depth: int) -> tuple:
+        """Finds the best available legal move for the current side to move."""
+        best_move = None
+        best_value = -9999999
+        alpha = -9999999
+        beta = 9999999
+        
+        legal_moves = self.generator.generate_moves(board)
+        if len(legal_moves) == 0:
+            return None, Evaluation.evaluate(board)
+            
+        # Basic positional move ordering based on capture flag properties
+        ordered_moves = sorted(legal_moves, key=lambda m: m.move_flag, reverse=True)
+        
+        for move in ordered_moves:
+            state_hist = board.make_move(move)
+            score = -self._alpha_beta(board, depth - 1, -beta, -alpha)
+            board.unmake_move(move, state_hist)
+            
+            # Log structural metrics to data science buffer pipelines
+            self.telemetry_records.append({
+                "active_color": board.move_colour,
+                "legal_moves_count": len(legal_moves),
+                "move_flag": move.move_flag,
+                "calculated_score": score
+            })
+            
+            if score > best_value:
+                best_value = score
+                best_move = move
+            alpha = max(alpha, score)
+            
+        return best_move, best_value
+
+    def _alpha_beta(self, board: Board, depth: int, alpha: int, beta: int) -> int:
+        if depth == 0:
+            return Evaluation.evaluate(board)
+            
+        moves = self.generator.generate_moves(board)
+        if len(moves) == 0:
+            return Evaluation.evaluate(board) # Resolves terminal node evaluations
+            
+        for move in moves:
+            state = board.make_move(move)
+            score = -self._alpha_beta(board, depth - 1, -beta, -alpha)
+            board.unmake_move(move, state)
+            
+            if score >= beta:
+                return beta
+            alpha = max(alpha, score)
+        return alpha
+
+    def export_telemetry_to_csv(self, filename: str = "engine_training_dataset.csv"):
+        """Exports the accumulated position analytics into a standardized dataset."""
+        df = pd.DataFrame(self.telemetry_records)
+        df.to_csv(filename, index=False)
+        print(f" Successfully synchronized {len(df)} records into target file: {filename}")
+
+
+# =====================================================================
+# 🏁 PIPELINE EXECUTION MODULE ENTRYPOINT
+# =====================================================================
+if __name__ == "__main__":
+    print("⏳ Initializing Chess AI Data Science Framework Context...")
+    
+    # 1. Initialize structural components
+    board = Board()
+    search_engine = Search()
+    
+    print("⚡ Executing Alpha-Beta Tree Search Analysis Routine...")
+    # 2. Run target alpha-beta tree calculations
+    best_move, target_score = search_engine.run_search(board, depth=3)
+    
+    if best_move:
+        print(f" Best Move Calculated: From Sq {best_move.start_square} -> Target Sq {best_move.target_square}")
+        print(f" Positional Evaluation Score: {target_score} centipawns")
+    
+    # 3. Process generated tabular records using pandas analytics
+    search_engine.export_telemetry_to_csv()
+
+
